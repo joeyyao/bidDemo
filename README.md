@@ -25,7 +25,7 @@ Web 页面访问 `http://localhost:5173`，API 文档访问 `http://localhost:80
 创建合同支持 DOCX、可提取文本的 PDF、TXT 和 MD 文件；扫描版 PDF 暂不支持 OCR。
 上传时提取的标书和参考文档正文保存在 SQLite 合同记录中；每个阶段对应的标书摘录和参考摘录保存在阶段记录中。后续重生成直接复用数据库里的文本与阶段内容，不会重新读取上传文件。
 
-这是用于本地演示的基础版本。SQLite 文件默认保存在 `backend/data/contracts.db`。规划、章节起草和章节自查只使用 `DASHSCOPE_BASE_URL` 配置的 Philips AI Gateway Chat Completions 地址；读取超时默认 10 分钟，可通过 `DASHSCOPE_TIMEOUT_SECONDS` 调整。遇到 408、429、500、502、503、504 或无响应时，会在同一地址自动重试，最多请求 3 次，并遵从网关返回的 `Retry-After`。重试状态会显示在 LangGraph 推理过程里。全部章节完成后，系统按计划顺序直接拼接章节标题和正文，不再调用模型做全文合并。项目不会在网关未配置时回退到本地模拟文本。
+这是用于本地演示的基础版本。SQLite 文件默认保存在 `backend/data/contracts.db`。规划、章节起草和章节自查只使用 `DASHSCOPE_BASE_URL` 配置的 Philips AI Gateway Chat Completions 地址；读取超时默认 30 分钟，可通过 `DASHSCOPE_TIMEOUT_SECONDS` 调整。遇到 408、429、500、502、503、504 或无响应时，会在同一地址自动重试，最多请求 3 次，并遵从网关返回的 `Retry-After`。重试状态会显示在 LangGraph 推理过程里。全部章节完成后，系统按计划顺序直接拼接章节标题和正文，不再调用模型做全文合并。项目不会在网关未配置时回退到本地模拟文本。
 
 ## 为什么按阶段生成能避免“提示词地狱”
 
