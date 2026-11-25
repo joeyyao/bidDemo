@@ -66,13 +66,15 @@ def ask(system: str, user: str, model: str = DEFAULT_MODEL,
                                                     {"role": "user", "content": user}], "temperature": 0.1}
         try:
             proxy = settings.dashscope_proxy or None
-            with httpx.Client(proxy=proxy, trust_env=False, timeout=120) as client:
+            timeout = httpx.Timeout(settings.dashscope_timeout_seconds, connect=20, write=120, pool=20)
+            with httpx.Client(proxy=proxy, trust_env=False, timeout=timeout) as client:
                 response = client.post(endpoint, headers={"Authorization": f"Bearer {settings.dashscope_api_key}",
                                                             "Content-Type": "application/json"},
                                        json=payload)
-            if response.status_code in (502, 503, 504):
+            if response.status_code in (408, 429, 500, 502, 503, 504):
                 if attempt <= len(retry_delays):
-                    delay = retry_delays[attempt - 1]
+                    retry_after = response.headers.get("Retry-After", "")
+                    delay = min(max(int(retry_after), 1), 30) if retry_after.isdigit() else retry_delays[attempt - 1]
                     if retry_callback:
                         try: retry_callback("retry", attempt, delay, response.status_code)
                         except Exception: logging.exception("Gateway retry progress callback failed")
