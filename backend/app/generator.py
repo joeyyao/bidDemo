@@ -56,30 +56,14 @@ def ask(system: str, user: str, model: str = DEFAULT_MODEL,
         raise RuntimeError("未配置 DASHSCOPE_API_KEY，无法调用模型网关")
     if model not in MODEL_OPTIONS:
         raise RuntimeError(f"不支持的推理模型：{model}")
-    primary = settings.dashscope_base_url.rstrip("/")
-    responses_url = settings.dashscope_responses_url.rstrip("/")
-    if primary.endswith("/v1/responses"):
-        endpoints = [primary, responses_url if responses_url != primary else primary.replace("/v1/responses", "/v1/chat/completions")]
-    elif primary.endswith("/v1/chat/completions"):
-        endpoints = [primary, responses_url if responses_url != primary else primary.replace("/v1/chat/completions", "/v1/responses")]
-    else:
-        gateway_root = primary.rstrip("/")
-        if not gateway_root.endswith("/Smart_bidding_chat"):
-            gateway_root += "/Smart_bidding_chat"
-        endpoints = [f"{gateway_root}/v1/chat/completions", responses_url]
-    endpoints = list(dict.fromkeys(endpoints))
+    endpoint = settings.dashscope_base_url.rstrip("/")
     system_text = long_prompt(system)
     retry_delays = (2, 5)
     attempt = 0
     while True:
         attempt += 1
-        endpoint = endpoints[(attempt - 1) % len(endpoints)]
-        is_responses_api = endpoint.endswith("/v1/responses")
-        if is_responses_api:
-            payload = {"model": model, "instructions": system_text, "input": user, "temperature": 0.1}
-        else:
-            payload = {"model": model, "messages": [{"role": "system", "content": system_text},
-                                                        {"role": "user", "content": user}], "temperature": 0.1}
+        payload = {"model": model, "messages": [{"role": "system", "content": system_text},
+                                                    {"role": "user", "content": user}], "temperature": 0.1}
         try:
             proxy = settings.dashscope_proxy or None
             with httpx.Client(proxy=proxy, trust_env=False, timeout=120) as client:
@@ -99,19 +83,9 @@ def ask(system: str, user: str, model: str = DEFAULT_MODEL,
                     except Exception: logging.exception("Gateway retry progress callback failed")
             response.raise_for_status()
             data = response.json()
-            if is_responses_api:
-                content = data.get("output_text", "")
-                if not content:
-                    output_parts = []
-                    for item in data.get("output", []):
-                        for part in item.get("content", []) if isinstance(item, dict) else []:
-                            if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
-                                output_parts.append(str(part.get("text", "")))
-                    content = "".join(output_parts)
-            else:
-                content = data["choices"][0]["message"]["content"]
-                if isinstance(content, list):
-                    content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+            content = data["choices"][0]["message"]["content"]
+            if isinstance(content, list):
+                content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
             if not str(content).strip():
                 if attempt <= len(retry_delays):
                     delay = retry_delays[attempt - 1]
@@ -142,7 +116,7 @@ def ask(system: str, user: str, model: str = DEFAULT_MODEL,
             if retry_callback:
                 try: retry_callback("failed", attempt, 0, 0)
                 except Exception: logging.exception("Gateway retry progress callback failed")
-            raise RuntimeError(f"两个模型接口均无响应，已自动切换并重试 {attempt} 次：{str(exc)[:400]}") from exc
+            raise RuntimeError(f"模型网关单一接口无响应，已在同一地址重试 {attempt} 次：{str(exc)[:400]}") from exc
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"模型网关调用失败：{str(exc)[:400]}") from exc
 

@@ -106,14 +106,14 @@ def gateway_progress_callback(contract_id: int, generation_id: str | None = None
                 return
             if state == "retry":
                 reason = f"HTTP {status_code}" if status_code else "接口无响应"
-                message = f"模型网关第 {attempt} 次请求遇到 {reason}；切换到另一个接口，{delay} 秒后重试（最多 3 次）。"
+                message = f"模型网关单一接口第 {attempt} 次请求遇到 {reason}；{delay} 秒后在同一地址重试（最多 3 次）。"
                 event_status = "running"
             elif state == "recovered":
                 message = f"模型网关重试后恢复，已在第 {attempt} 次请求成功。"
                 event_status = "completed"
             else:
                 reason = f"HTTP {status_code}" if status_code else "接口无响应"
-                message = f"两个模型接口连续 {attempt} 次请求失败（{reason}），自动重试次数已用尽。"
+                message = f"模型网关单一接口连续 {attempt} 次请求失败（{reason}），自动重试次数已用尽。"
                 event_status = "failed"
             record_event(progress_db, contract_id, "gateway_retry", "LangGraph · 模型网关重试",
                          event_status, message)
