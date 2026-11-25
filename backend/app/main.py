@@ -15,7 +15,7 @@ from .database import Base, engine, get_db, SessionLocal
 from .models import User, Contract, Chapter, Version, WorkflowEvent
 from .schemas import Credentials, TokenOut, PromptUpdate, ModelUpdate, StageModelUpdate, ChapterCreate, ChapterTitleUpdate, ChapterOrderUpdate, ModelName
 from .auth import hash_password, verify_password, make_token, current_user
-from .generator import workflow, cover_plan, long_prompt, draft_stage, merge_node, final_node, normalize_model_text
+from .generator import workflow, cover_plan, long_prompt, draft_stage, merge_node, normalize_model_text
 
 Path("data").mkdir(exist_ok=True)
 Base.metadata.create_all(bind=engine)
@@ -172,8 +172,7 @@ def run_generation(contract_id: int, generation_id: str | None = None):
         gateway_progress = gateway_progress_callback(contract_id, generation_id)
         try: node_models = json.loads(c.node_models or "{}")
         except (json.JSONDecodeError, TypeError): node_models = {}
-        node_models = {"planner": "qwen3.8-flash", "chapter_default": "qwen3.8-flash",
-                       "merge": "qwen3.8-flash", "final_check": "qwen3.8-flash", **node_models}
+        node_models = {"planner": "qwen3.8-flash", "chapter_default": "qwen3.8-flash", **node_models}
         record_event(db, c.id, "tender_parse", "LangGraph · 标书解析", "completed",
                      "已读取合同记录中保存的标书解析文本。" if c.tender_text else "未上传标书，跳过解析。")
         record_event(db, c.id, "reference_parse", "LangGraph · 参考合同解析", "completed",
@@ -234,7 +233,7 @@ def run_generation(contract_id: int, generation_id: str | None = None):
         merge_started = bool(plan_count and completed_chapters == plan_count)
         if merge_started:
             record_event(db, c.id, "merge", "LangGraph · 全文合并", "running",
-                         "所有阶段已有可用的正文和自查结果；继续执行全文合并与最终检查。", node_models["merge"])
+                         "所有阶段已有可用的正文和自查结果；按阶段顺序直接拼接全文。")
         for update in workflow.stream(state, stream_mode="updates"):
             if not is_current_generation(db, contract_id, generation_id):
                 return
@@ -289,9 +288,11 @@ def run_generation(contract_id: int, generation_id: str | None = None):
                 if plan_count and completed_chapters == plan_count and not merge_started:
                     merge_started = True
                     record_event(db, c.id, "merge", "LangGraph · 全文合并", "running",
-                                 "所有章节生成与自查均已完成；LangGraph 现在进入合并节点调用模型生成完整合同。", node_models["merge"])
+                                 "所有章节生成与自查均已完成；LangGraph 正在按阶段顺序直接拼接全文。")
             if "merge" in update:
                 c.final_text = update["merge"]["final_text"]
+                c.final_check = ""
+                c.status = "completed"
                 vn = db.scalar(select(func.count(Version.id)).where(Version.contract_id == c.id, Version.chapter_id.is_(None))) or 0
                 db.add(Version(contract_id=c.id, chapter_id=None, version_no=vn+1, content=c.final_text))
                 if not is_current_generation(db, contract_id, generation_id):
@@ -299,23 +300,13 @@ def run_generation(contract_id: int, generation_id: str | None = None):
                     return
                 db.commit()
                 record_event(db, c.id, "merge", "LangGraph · 全文合并", "completed",
-                             "完整合同已由合并模型生成并保存版本。", node_models["merge"])
-                record_event(db, c.id, "final_check", "LangGraph · 最终检查", "running",
-                             "完整合同已进入最终检查节点。", node_models["final_check"])
-            if "final_check" in update:
-                c.final_check = update["final_check"]["final_check"]; c.status = "completed"
-                if not is_current_generation(db, contract_id, generation_id):
-                    db.rollback()
-                    return
-                db.commit()
-                record_event(db, c.id, "final_check", "LangGraph · 最终检查", "completed",
-                             "最终检查完成，合同生成流程结束。", node_models["final_check"])
+                             "完整合同已按阶段顺序直接拼接并保存版本；流程结束。")
     except Exception as exc:
         c = db.get(Contract, contract_id)
         if c and not is_current_generation(db, contract_id, generation_id):
             return
         if c:
-            c.status = "failed"; c.final_check = f"生成失败：{str(exc)[:400]}"; db.commit()
+            c.status = "failed"; c.final_check = ""; db.commit()
             record_event(db, c.id, "workflow", "LangGraph · 流程异常", "failed", str(exc)[:800])
     finally: db.close()
 
@@ -328,9 +319,9 @@ def list_contracts(db: Session = Depends(get_db), user: User = Depends(current_u
 @app.post("/api/contracts", status_code=202)
 async def create_contract(tasks: BackgroundTasks, title: str = Form(...), contract_number: str = Form(...),
                           requirements: str = Form(default=""), planner_model: ModelName = Form(default="qwen3.8-flash"),
-                          chapter_model: ModelName = Form(default="qwen3.8-flash"), merge_model: ModelName = Form(default="qwen3.8-flash"),
-                          final_check_model: ModelName = Form(default="qwen3.8-flash"), tender_file: UploadFile | None = File(default=None),
-                          reference_file: UploadFile | None = File(default=None), db: Session = Depends(get_db),
+                          chapter_model: ModelName = Form(default="qwen3.8-flash"),
+                          tender_file: UploadFile | None = File(default=None), reference_file: UploadFile | None = File(default=None),
+                          db: Session = Depends(get_db),
                           user: User = Depends(current_user)):
     if not title.strip() or not contract_number.strip(): raise HTTPException(422, "合同名称和合同编号不能为空")
     if len(title.strip()) > 200 or len(contract_number.strip()) > 120 or len(requirements) > 20000:
@@ -339,8 +330,7 @@ async def create_contract(tasks: BackgroundTasks, title: str = Form(...), contra
     reference_filename, reference_text = await extract_document(reference_file)
     if len(requirements.strip()) < 10 and not tender_text:
         raise HTTPException(422, "请填写至少 10 个字的合同要求，或上传标书作为拆分依据")
-    node_models = {"planner": planner_model, "chapter_default": chapter_model,
-                   "merge": merge_model, "final_check": final_check_model}
+    node_models = {"planner": planner_model, "chapter_default": chapter_model}
     c = Contract(user_id=user.id, title=title.strip(), contract_number=contract_number.strip(),
                  requirements=requirements.strip(), tender_filename=tender_filename, tender_text=tender_text,
                  reference_filename=reference_filename, reference_text=reference_text, status="queued",
@@ -541,7 +531,7 @@ def restart_all(contract_id: int, tasks: BackgroundTasks, db: Session = Depends(
         chapter.status = "pending"; chapter.content = ""; chapter.self_check = ""
     db.commit()
     record_event(db, c.id, "workflow_restart", "LangGraph · 全流程重启", "completed",
-                 "用户重启了全部流程；旧流程结果将被忽略，按当前阶段列表重新生成全部章节并重新执行合并与最终检查。")
+                 "用户重启了全部流程；旧流程结果将被忽略，按当前阶段列表重新生成全部章节并执行全文合并。")
     tasks.add_task(run_generation, c.id, c.generation_id)
     return {"status": "queued"}
 
@@ -578,7 +568,7 @@ def continue_workflow(contract_id: int, tasks: BackgroundTasks, db: Session = De
         chapter.status = "completed" if chapter.content and chapter.self_check else "pending"
     db.commit()
     record_event(db, c.id, "workflow_continue", "LangGraph · 继续流程", "completed",
-                 "继续生成已启动；保留已完成章节，仅重跑未完成节点，然后执行全文合并与最终检查。")
+                 "继续生成已启动；保留已完成章节，仅重跑未完成节点，然后执行全文合并。")
     tasks.add_task(run_generation, c.id, c.generation_id)
     return {"status": "queued"}
 
@@ -589,42 +579,33 @@ def merge_now(contract_id: int, db: Session = Depends(get_db), user: User = Depe
     chapters = db.scalars(select(Chapter).where(Chapter.contract_id == c.id, Chapter.deleted_at.is_(None)).order_by(Chapter.order)).all()
     if not chapters:
         raise HTTPException(409, "尚无阶段计划，暂时无法合并文本")
-    try:
-        node_models = json.loads(c.node_models or "{}")
-    except (json.JSONDecodeError, TypeError):
-        node_models = {}
     state = {
-        "requirements": c.requirements,
-        "node_models": node_models,
-        "retry_callback": gateway_progress_callback(c.id, generation_id),
         "plans": [{"title": chapter.title} for chapter in chapters],
         "generated": [{"title": chapter.title,
                        "content": chapter.content or "【该阶段尚未生成，生成完成后可再次合并】"}
                       for chapter in chapters],
     }
     record_event(db, c.id, "merge_now", "LangGraph · 直接合并文本", "running",
-                 "按当前阶段顺序合并已有章节文本；尚未生成的阶段会保留待生成标记。",
-                 node_models.get("merge", "qwen3.8-flash"))
+                 "按当前阶段顺序直接拼接已有章节文本；尚未生成的阶段会保留待生成标记。")
     try:
         merged = merge_node(state)["final_text"]
-        checked = final_node({**state, "final_text": merged})["final_check"]
         if not is_current_generation(db, c.id, generation_id):
             raise HTTPException(409, "全流程已重启，旧的合并结果已丢弃")
     except HTTPException:
         raise
     except Exception as exc:
-        record_event(db, c.id, "merge_now", "LangGraph · 直接合并文本", "failed", str(exc)[:800],
-                     node_models.get("merge", "qwen3.8-flash"))
+        record_event(db, c.id, "merge_now", "LangGraph · 直接合并文本", "failed", str(exc)[:800])
         raise HTTPException(502, f"直接生成文本失败：{str(exc)[:500]}") from exc
     c.final_text = merged
-    c.final_check = checked
+    c.final_check = ""
+    if all(chapter.content and chapter.self_check for chapter in chapters):
+        c.status = "completed"
     version_no = db.scalar(select(func.count(Version.id)).where(Version.contract_id == c.id, Version.chapter_id.is_(None))) or 0
     db.add(Version(contract_id=c.id, chapter_id=None, version_no=version_no + 1, content=merged))
     db.commit()
     record_event(db, c.id, "merge_now", "LangGraph · 直接合并文本", "completed",
-                 "已基于当前可用章节文本完成合并和最终检查；未完成阶段保留待生成标记。",
-                 node_models.get("merge", "qwen3.8-flash"))
-    return {"final_text": merged, "final_check": checked}
+                 "已基于当前可用章节文本直接完成拼接；未完成阶段保留待生成标记。")
+    return {"final_text": merged}
 
 @app.patch("/api/contracts/{contract_id}/chapters/{chapter_id}/prompt")
 def update_prompt(contract_id: int, chapter_id: int, data: PromptUpdate, db: Session = Depends(get_db), user: User = Depends(current_user)):

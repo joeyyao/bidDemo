@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     dashscope_api_key: str = ""
     dashscope_base_url: str = "https://gateway.ai.philips.com.cn/Smart_bidding_chat/v1/chat/completions"
     dashscope_responses_url: str = "https://gateway.ai.philips.com.cn/Smart_bidding_chat/v1/responses"
+    dashscope_proxy: str = ""
     dashscope_model: str = "qwen3.8-flash"
     cors_origins: str = "http://localhost:5173"
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

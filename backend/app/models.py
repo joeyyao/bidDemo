@@ -28,7 +28,7 @@ class Contract(Base):
     final_check: Mapped[str] = mapped_column(Text, default="")
     generation_id: Mapped[str] = mapped_column(String(36), default="")
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
-    node_models: Mapped[str] = mapped_column(Text, default='{"planner":"qwen3.8-flash","merge":"qwen3.8-flash","final_check":"qwen3.8-flash"}')
+    node_models: Mapped[str] = mapped_column(Text, default='{"planner":"qwen3.8-flash","chapter_default":"qwen3.8-flash"}')
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
     chapters: Mapped[list["Chapter"]] = relationship(back_populates="contract", cascade="all, delete-orphan")

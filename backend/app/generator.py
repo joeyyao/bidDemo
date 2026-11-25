@@ -50,8 +50,6 @@ REVIEW_SYSTEM_PROMPT = long_prompt("""你是合同章节自查节点。请按照
 
 MERGE_SYSTEM_PROMPT = long_prompt("""你是 LangGraph 的完整合同合并节点。输入章节可能全部完成，也可能仍有阶段正在生成。请根据规划顺序将每章正文合并为一份连续、可阅读的合同文本，保留经节点生成的实质条款、章节标题、层级和编号；统一当事方名称、术语、日期、金额格式和条款引用，修正明显的格式断裂与重复标题。若某一阶段内容是【该阶段尚未生成，生成完成后可再次合并】，必须在对应标题下原样保留此占位标记，不得代写或推测该阶段的合同条款。不得因为追求简短而删除已生成内容中的权利义务、条件、程序或责任，不得新增用户未提出的商业条件或虚构事实。若发现章节间存在无法安全消解的冲突，应保留相关约定并用【需确认：……】标明，不要擅自替用户作选择。将待补充项保留在适当位置。只输出合并后的完整合同正文，不输出过程说明、摘要、检查报告或隐藏推理内容。""")
 
-FINAL_SYSTEM_PROMPT = long_prompt("""你是完整合同最终检查节点。请对合并后的完整合同与用户原始要求进行整体一致性检查，覆盖合同主体、交易目标、章节完整性、关键知识点、履行和验收、价款、时间、术语、章节交叉引用、待补充项、重复或冲突约定以及明显不可执行表述。检查时区分确定存在的问题与需要用户确认的事项，不要推断未提供的事实，不要宣称合同已经具备法律效力或保证风险为零。输出明确的总体检查状态、已覆盖的检查范围、需要优先处理的问题及其所在章节、建议修订方向，以及仍需业务人员确认的【待补充】信息。如果未发现重大冲突，也应指出仍需人工核对的关键字段。只输出最终检查报告，不要改写合同正文，不要输出隐藏思维链。""")
-
 def ask(system: str, user: str, model: str = DEFAULT_MODEL,
         retry_callback: Callable[[str, int, int, int], None] | None = None) -> str:
     if not settings.dashscope_api_key:
@@ -83,7 +81,8 @@ def ask(system: str, user: str, model: str = DEFAULT_MODEL,
             payload = {"model": model, "messages": [{"role": "system", "content": system_text},
                                                         {"role": "user", "content": user}], "temperature": 0.1}
         try:
-            with httpx.Client(trust_env=False, proxy=None, timeout=600) as client:
+            proxy = settings.dashscope_proxy or None
+            with httpx.Client(proxy=proxy, trust_env=False, timeout=120) as client:
                 response = client.post(endpoint, headers={"Authorization": f"Bearer {settings.dashscope_api_key}",
                                                             "Content-Type": "application/json"},
                                        json=payload)
@@ -263,7 +262,6 @@ class State(TypedDict, total=False):
     completed_titles: list[str]
     chapter: dict
     final_text: str
-    final_check: str
     retry_callback: Callable[[str, int, int, int], None]
 
 def plan_node(state: State):
@@ -318,28 +316,16 @@ def merge_node(state: State):
         if not generated:
             raise RuntimeError(f"章节节点未完成，停止合并：{plan['title']}")
         sections.append(f"{plan['title']}\n\n{generated['content']}")
-    merge_input = (f"用户核心要求：\n{state['requirements']}\n\n按以下规划顺序合并全部已完成章节：\n\n"
-                   + "\n\n".join(sections))
-    model = state["node_models"].get("merge", DEFAULT_MODEL)
-    return {"final_text": ask(MERGE_SYSTEM_PROMPT, merge_input, model, state.get("retry_callback"))}
-
-def final_node(state: State):
-    model = state["node_models"].get("final_check", DEFAULT_MODEL)
-    final_check = ask(FINAL_SYSTEM_PROMPT,
-                      f"用户核心要求：\n{state['requirements']}\n\n合并后的合同全文：\n{state['final_text']}", model,
-                      state.get("retry_callback"))
-    return {"final_check": final_check}
+    return {"final_text": "\n\n".join(sections)}
 
 builder = StateGraph(State)
 builder.add_node("plan", plan_node)
 builder.add_node("generate", generate_node)
 builder.add_node("merge", merge_node)
-builder.add_node("final_check", final_node)
 builder.add_conditional_edges(START, start_route, ["plan", "generate", "merge"])
 builder.add_conditional_edges("plan", fanout, ["generate"])
 builder.add_edge("generate", "merge")
-builder.add_edge("merge", "final_check")
-builder.add_edge("final_check", END)
+builder.add_edge("merge", END)
 workflow = builder.compile()
 
 chapter_builder = StateGraph(State)

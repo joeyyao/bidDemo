@@ -4,7 +4,7 @@ Vue 3 + Vant 前端，FastAPI + SQLite 后端，LangGraph 编排合同章节生�
 
 ## 启动
 
-首次启动前，将 `backend/.env.example` 复制为 `backend/.env`，并在其中填写 `DASHSCOPE_API_KEY`。该本地配置文件不会提交到 Git。然后在根目录运行下面命令；启动脚本会自动创建后端虚拟环境并安装前后端依赖。
+首次启动前，将 `backend/.env.example` 复制为 `backend/.env`，并在其中填写 `DASHSCOPE_API_KEY`。示例文件已配置 Philips Zscaler 代理地址；可按网络环境调整 `DASHSCOPE_PROXY`。该本地配置文件不会提交到 Git。然后在根目录运行下面命令；启动脚本会自动创建后端虚拟环境并安装前后端依赖。
 
 ```powershell
 python start.py
@@ -15,7 +15,7 @@ Web 页面访问 `http://localhost:5173`，API 文档访问 `http://localhost:80
 ## 当前能力
 
 - 注册、登录、合同项目列表和项目详情
-- 输入需求后由 LangGraph 拆章节计划，逐章生成、自查、汇总及最终检查
+- 输入需求后由 LangGraph 拆章节计划，逐章生成、自查及全文汇总
 - 上传标书和参考文档，按标书拆分阶段并将对应原文、参考文本关联到每个阶段
 - 新增自定义阶段、编辑阶段标题、折叠阶段和拖动调整顺序；全文重生成时沿用当前阶段计划
 - 章节状态、检查结果、提示词调整和单章重新生成
@@ -25,7 +25,7 @@ Web 页面访问 `http://localhost:5173`，API 文档访问 `http://localhost:80
 创建合同支持 DOCX、可提取文本的 PDF、TXT 和 MD 文件；扫描版 PDF 暂不支持 OCR。
 上传时提取的标书和参考文档正文保存在 SQLite 合同记录中；每个阶段对应的标书摘录和参考摘录保存在阶段记录中。后续重生成直接复用数据库里的文本与阶段内容，不会重新读取上传文件。
 
-这是用于本地演示的基础版本。SQLite 文件默认保存在 `backend/data/contracts.db`。模型请求先使用 `DASHSCOPE_BASE_URL` 配置的 Philips AI Gateway Chat Completions 接口；遇到 502、503、504 或无响应时，会切换到 `DASHSCOPE_RESPONSES_URL` 配置的 Responses 接口并自动重试，最多请求 3 次。重试状态会显示在 LangGraph 推理过程里。项目不会在网关未配置时回退到本地模拟文本。
+这是用于本地演示的基础版本。SQLite 文件默认保存在 `backend/data/contracts.db`。规划、章节起草和章节自查使用 `DASHSCOPE_BASE_URL` 配置的 Philips AI Gateway Chat Completions 接口；遇到 502、503、504 或无响应时，会切换到 `DASHSCOPE_RESPONSES_URL` 配置的 Responses 接口并自动重试，最多请求 3 次。重试状态会显示在 LangGraph 推理过程里。全部章节完成后，系统按计划顺序直接拼接章节标题和正文，不再调用模型做全文合并。项目不会在网关未配置时回退到本地模拟文本。
 
 ## 为什么按阶段生成能避免“提示词地狱”
 

@@ -16,8 +16,6 @@ class ContractCreate(BaseModel):
     requirements: str = Field(min_length=10, max_length=20000)
     planner_model: ModelName = "qwen3.8-flash"
     chapter_model: ModelName = "qwen3.8-flash"
-    merge_model: ModelName = "qwen3.8-flash"
-    final_check_model: ModelName = "qwen3.8-flash"
 class ChapterCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     description: str = Field(min_length=1, max_length=5000)
@@ -30,5 +28,5 @@ class PromptUpdate(BaseModel):
 class ModelUpdate(BaseModel):
     model: ModelName
 class StageModelUpdate(BaseModel):
-    stage: Literal["planner", "chapter_default", "merge", "final_check"]
+    stage: Literal["planner", "chapter_default"]
     model: ModelName
