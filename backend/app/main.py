@@ -23,7 +23,7 @@ from docx.oxml.ns import qn
 from .config import settings
 from .database import Base, engine, get_db, SessionLocal
 from .models import User, Contract, Chapter, Version, WorkflowEvent
-from .schemas import Credentials, TokenOut, PromptUpdate, ModelUpdate, StageModelUpdate, ChapterCreate, ChapterTitleUpdate, ChapterOrderUpdate, ModelName, FinalDocumentUpdate
+from .schemas import Credentials, LoginCredentials, TokenOut, PromptUpdate, ModelUpdate, StageModelUpdate, ChapterCreate, ChapterTitleUpdate, ChapterOrderUpdate, ModelName, FinalDocumentUpdate
 from .auth import hash_password, verify_password, make_token, current_user
 from .generator import (workflow, cover_plan, long_prompt, draft_stage, merge_node, normalize_model_text,
                         compact_document_text, OPENING_OVERVIEW_TITLE)
@@ -101,7 +101,7 @@ def register(data: Credentials, db: Session = Depends(get_db)):
     return {"access_token": make_token(user), "username": user.username}
 
 @app.post("/api/auth/login", response_model=TokenOut)
-def login(data: Credentials, db: Session = Depends(get_db)):
+def login(data: LoginCredentials, db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.username == data.username))
     if not user or not verify_password(data.password, user.password_hash): raise HTTPException(401, "用户名或密码错误")
     return {"access_token": make_token(user), "username": user.username}
