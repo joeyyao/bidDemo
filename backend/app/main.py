@@ -15,7 +15,7 @@ from .database import Base, engine, get_db, SessionLocal
 from .models import User, Contract, Chapter, Version, WorkflowEvent
 from .schemas import Credentials, TokenOut, PromptUpdate, ModelUpdate, StageModelUpdate, ChapterCreate, ChapterTitleUpdate, ChapterOrderUpdate, ModelName
 from .auth import hash_password, verify_password, make_token, current_user
-from .generator import workflow, cover_plan, long_prompt, draft_stage, merge_node, normalize_model_text
+from .generator import workflow, cover_plan, long_prompt, draft_stage, merge_node, normalize_model_text, compact_document_text
 
 Path("data").mkdir(exist_ok=True)
 Base.metadata.create_all(bind=engine)
@@ -26,7 +26,9 @@ with engine.begin() as connection:
         "generation_id": "VARCHAR(36) NOT NULL DEFAULT ''",
         "deleted_at": "DATETIME NULL",
         "tender_filename": "VARCHAR(255) NOT NULL DEFAULT ''", "tender_text": "TEXT NOT NULL DEFAULT ''",
+        "tender_compact_text": "TEXT NOT NULL DEFAULT ''",
         "reference_filename": "VARCHAR(255) NOT NULL DEFAULT ''", "reference_text": "TEXT NOT NULL DEFAULT ''",
+        "reference_compact_text": "TEXT NOT NULL DEFAULT ''",
     }
     for column, definition in contract_migrations.items():
         if column not in contract_columns:
@@ -169,6 +171,12 @@ def run_generation(contract_id: int, generation_id: str | None = None):
             db.rollback()
             return
         db.commit()
+        if not c.tender_compact_text and c.tender_text:
+            c.tender_compact_text = compact_document_text(c.tender_text, 30000)
+        if not c.reference_compact_text and c.reference_text:
+            c.reference_compact_text = compact_document_text(c.reference_text, 18000)
+        if c.tender_compact_text or c.reference_compact_text:
+            db.commit()
         gateway_progress = gateway_progress_callback(contract_id, generation_id)
         try: node_models = json.loads(c.node_models or "{}")
         except (json.JSONDecodeError, TypeError): node_models = {}
@@ -224,6 +232,7 @@ def run_generation(contract_id: int, generation_id: str | None = None):
         state = {"requirements": c.requirements, "node_models": node_models,
                  "contract_title": c.title, "contract_number": c.contract_number,
                  "tender_text": c.tender_text, "reference_text": c.reference_text,
+                 "tender_compact_text": c.tender_compact_text, "reference_compact_text": c.reference_compact_text,
                  "retry_callback": gateway_progress}
         if plans is not None:
             state["plans"] = plans
@@ -328,12 +337,16 @@ async def create_contract(tasks: BackgroundTasks, title: str = Form(...), contra
         raise HTTPException(422, "合同名称、编号或补充要求超过长度限制")
     tender_filename, tender_text = await extract_document(tender_file)
     reference_filename, reference_text = await extract_document(reference_file)
+    tender_compact_text = compact_document_text(tender_text, 30000)
+    reference_compact_text = compact_document_text(reference_text, 18000)
     if len(requirements.strip()) < 10 and not tender_text:
         raise HTTPException(422, "请填写至少 10 个字的合同要求，或上传标书作为拆分依据")
     node_models = {"planner": planner_model, "chapter_default": chapter_model}
     c = Contract(user_id=user.id, title=title.strip(), contract_number=contract_number.strip(),
                  requirements=requirements.strip(), tender_filename=tender_filename, tender_text=tender_text,
-                 reference_filename=reference_filename, reference_text=reference_text, status="queued",
+                 tender_compact_text=tender_compact_text,
+                 reference_filename=reference_filename, reference_text=reference_text,
+                 reference_compact_text=reference_compact_text, status="queued",
                  generation_id=str(uuid4()), node_models=json.dumps(node_models)); db.add(c); db.commit(); db.refresh(c)
     tasks.add_task(run_generation, c.id, c.generation_id)
     return {"id": c.id, "status": c.status}

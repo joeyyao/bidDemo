@@ -5,6 +5,7 @@ import logging
 import time
 from typing import Annotated, Callable, TypedDict
 import operator
+import re
 import httpx
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
@@ -135,6 +136,43 @@ def relevant_excerpt(document: str, title: str, knowledge_points: str, limit: in
     chosen = sorted((index, paragraph) for _, index, paragraph in relevant)
     return "\n".join(paragraph for _, paragraph in chosen)[:limit]
 
+def compact_document_text(document: str, limit: int = 30000) -> str:
+    """Build and persist an extractive, one-pass planning view while retaining raw source text."""
+    if not document:
+        return ""
+    lines = []
+    seen = set()
+    for raw_line in document.replace("\r", "\n").splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+    normalized = "\n".join(lines)
+    if len(normalized) <= limit:
+        return normalized
+
+    important = re.compile(r"招标|投标|标书|采购|项目|合同|需求|范围|服务|技术|商务|交付|验收|质量|标准|期限|工期|进度|价款|报价|付款|支付|违约|责任|保密|知识产权|资质|资格|评分|响应|义务|权利|结算|保证|履约|风险|security|scope|delivery|acceptance|payment|requirement|qualification|technical|commercial", re.I)
+    heading = re.compile(r"^(第[一二三四五六七八九十百0-9]+[章节条部分]|[一二三四五六七八九十]+[、.．]|\d+(?:\.\d+){0,3}[、.． ]|【[^】]{1,60}】)")
+    scored = []
+    for index, line in enumerate(lines):
+        score = (5 if important.search(line) else 0) + (4 if heading.search(line) else 0)
+        if len(line) < 180:
+            score += 1
+        if len(line) > 1800:
+            score -= 2
+        scored.append((score, index, line))
+    # Keep the document boundaries and prioritize clause headings and requirement-bearing lines.
+    chosen = {0, len(lines) - 1}
+    budget = max(0, limit - len(lines))
+    used = sum(len(lines[i]) for i in chosen)
+    for _, index, line in sorted(scored, key=lambda item: (-item[0], item[1])):
+        if index in chosen or used + len(line) > budget:
+            continue
+        chosen.add(index)
+        used += len(line)
+    return "\n".join(lines[index] for index in sorted(chosen))[:limit]
+
 def verified_excerpt(candidate: str, document: str, title: str, knowledge_points: str) -> str:
     candidate = candidate.strip()
     if candidate and document and candidate in document:
@@ -155,9 +193,11 @@ STAGE_DESIGN_PROMPT = long_prompt("""你是合同阶段设计节点。用户已�
 def draft_stage(title: str, description: str, contract_title: str, contract_number: str,
                 requirements: str, tender_text: str, reference_text: str, model: str,
                 retry_callback: Callable[[str, int, int, int], None] | None = None) -> dict:
+    tender_excerpt = relevant_excerpt(tender_text, title, description, limit=12000) or compact_document_text(tender_text, 12000)
+    reference_excerpt = relevant_excerpt(reference_text, title, description, limit=10000) or compact_document_text(reference_text, 10000)
     user_prompt = (f"合同名称：{contract_title}\n合同编号：{contract_number}\n合同核心要求：\n{requirements or '主要依据上传标书'}\n\n"
-                   f"阶段名称：{title}\n用户描述：\n{description}\n\n标书全文：\n{tender_text or '未上传标书'}\n\n"
-                   f"参考文档全文：\n{reference_text or '未上传参考文档'}")
+                   f"阶段名称：{title}\n用户描述：\n{description}\n\n标书相关文本（由已保存的解析文本提取）：\n{tender_excerpt or '未上传标书'}\n\n"
+                   f"参考文档相关文本（由已保存的解析文本提取）：\n{reference_excerpt or '未上传参考文档'}")
     raw = ask(STAGE_DESIGN_PROMPT, user_prompt, model, retry_callback).strip()
     if raw.startswith("```"):
         raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -233,6 +273,8 @@ class State(TypedDict, total=False):
     contract_number: str
     tender_text: str
     reference_text: str
+    tender_compact_text: str
+    reference_compact_text: str
     plans: list[dict]
     generated: Annotated[list[dict], operator.add]
     completed_titles: list[str]
@@ -244,9 +286,11 @@ def plan_node(state: State):
     model = state["node_models"].get("planner", DEFAULT_MODEL)
     tender = state.get("tender_text", "")
     reference = state.get("reference_text", "")
+    tender_for_prompt = state.get("tender_compact_text") or compact_document_text(tender)
+    reference_for_prompt = state.get("reference_compact_text") or compact_document_text(reference, 18000)
     prompt = (f"合同名称：{state.get('contract_title', '合同')}\n合同编号：{state.get('contract_number', '【待补充】')}\n"
-              f"用户补充要求：\n{state['requirements']}\n\n标书正文（以此作为拆分依据）：\n{tender or '未上传标书'}\n\n"
-              f"参考文档（只用于对应章节的结构与文风）：\n{reference or '未上传参考文档'}")
+              f"用户补充要求：\n{state['requirements']}\n\n标书压缩文本（以此作为拆分依据）：\n{tender_for_prompt or '未上传标书'}\n\n"
+              f"参考文档压缩文本（只用于对应章节的结构与文风）：\n{reference_for_prompt or '未上传参考文档'}")
     raw = ask(PLANNER_PROMPT, prompt, model, state.get("retry_callback"))
     return {"plans": parse_plans(raw, state["requirements"], state["node_models"].get("chapter_default", DEFAULT_MODEL),
                                   state.get("contract_title", "合同"), state.get("contract_number", "【待补充】"), tender, reference)}
