@@ -56,7 +56,9 @@ def contract_dict(c: Contract):
     except (json.JSONDecodeError, TypeError): final_document = None
     return {"id": c.id, "title": c.title, "contract_number": c.contract_number,
             "requirements": c.requirements, "tender_filename": c.tender_filename,
-            "reference_filename": c.reference_filename, "status": c.status,
+            "tender_compact_text": c.tender_compact_text or compact_document_text(c.tender_text, 30000),
+            "reference_filename": c.reference_filename,
+            "reference_compact_text": c.reference_compact_text or compact_document_text(c.reference_text, 18000), "status": c.status,
             "final_text": c.final_text, "final_check": c.final_check,
             "final_document": final_document, "document_header": c.document_header,
             "document_footer": c.document_footer, "page_number_format": c.page_number_format,
