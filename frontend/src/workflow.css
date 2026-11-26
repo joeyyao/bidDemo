@@ -318,6 +318,7 @@
 .word-paper .word-edit-block,.word-paper .word-edit-table{font-size:10pt}
 .word-paper .word-edit-block.word-heading,.word-paper .word-edit-block.word-subheading{font-size:10pt;font-weight:700;margin-bottom:10px}
 .word-paper .word-edit-block.word-paragraph{font-size:10pt;font-weight:400}
+.word-paper .signature-block{margin-top:14pt;font-family:"Microsoft YaHei","微软雅黑",sans-serif;font-size:10pt;line-height:1.65;white-space:pre-wrap}
 .word-paper .word-edit-table,.word-paper .word-edit-table td,.word-paper .word-table-text,.word-paper .word-edit-table-cell{font-size:9pt}
 .word-paper .word-page-meta,.word-paper .word-page-footer,.word-paper .word-page-meta input,.word-paper .word-page-footer input{font-size:10pt}
 .word-paper .word-page-content{padding-top:0}

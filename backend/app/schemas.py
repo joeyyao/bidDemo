@@ -41,9 +41,11 @@ class FinalDocumentTableCell(BaseModel):
     placeholder: bool = False
 
 class FinalDocumentBlock(BaseModel):
-    kind: Literal["heading", "subheading", "paragraph", "table"] = "paragraph"
+    kind: Literal["heading", "subheading", "paragraph", "table", "source_html", "signature"] = "paragraph"
     text: str = Field(default="", max_length=100000)
     source_table_index: int | None = Field(default=None, ge=0)
+    source_table_indices: list[int] = Field(default_factory=list)
+    source_element_indices: list[int] = Field(default_factory=list)
     rows: list[list[FinalDocumentTableCell]] = Field(default_factory=list)
     header_row: bool = False
     column_alignments: list[Literal["left", "center", "right"]] = Field(default_factory=list)

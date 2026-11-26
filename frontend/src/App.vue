@@ -32,7 +32,6 @@ const detailTab = ref('content')
 const projectListView = ref('cards')
 const chapterRetrying = ref([])
 const addingStage = ref(false)
-const OPENING_OVERVIEW_TITLE = '开标一览表'
 const planningTextPreview = ref(null)
 const editorOpen = ref(false), finalDocument = ref(null), editorSaving = ref(false), editorSavedAt = ref(''), editorDirty = ref(false), activeEditorSection = ref(0)
 const tenderFormatNotice = ref('')
@@ -140,10 +139,11 @@ async function restoreTenderSource(event){
     selected.value.tender_source_available=true
     selected.value.tender_source_filename=layout.filename
     if(layout.tender_compact_text)selected.value.tender_compact_text=layout.tender_compact_text
+    if(layout.tender_html_length)selected.value.tender_html_length=layout.tender_html_length
     const preview=tablePreview.value
     if(preview?.id===id){
-      const splitBlocks=preview.showSplitText?(await readTenderLayout(id,true)).split_blocks:preview.layout?.split_blocks
-      if(tablePreview.value===preview)preview.layout={...layout,split_blocks:splitBlocks}
+      const splitData=preview.showSplitText?await readTenderLayout(id,true):{}
+      if(tablePreview.value===preview)preview.layout={...layout,...splitData}
     }
     if(editorOpen.value){
       syncEditorDom()
@@ -238,12 +238,8 @@ function applyTenderLayout(draft,layout,preserveEdits){
   if(!layout.supported){
     const count=layout.tables.length
     const blocks=layout.tables.map(table=>({...table,kind:'table'}))
-    const overviewTable=blocks.find(table=>table.caption==='开标一览表')
-    const overviewChapter=draft.sections.find(section=>!section.source_material&&section.title.trim()===OPENING_OVERVIEW_TITLE)
-    if(overviewTable&&overviewChapter)overviewChapter.blocks=[{...overviewTable,caption:''}]
-    const appendixBlocks=overviewTable&&overviewChapter?blocks.filter(table=>table.table_index!==overviewTable.table_index):blocks
     draft.sections=draft.sections.filter(section=>!section.source_material)
-    if(appendixBlocks.length)draft.sections.push({title:'标书表格参考',source_material:true,preview_only:true,blocks:appendixBlocks})
+    if(blocks.length)draft.sections.push({title:'标书表格参考',source_material:true,preview_only:true,blocks})
     tenderFormatNotice.value=count?`编辑区已显示从旧项目文字识别的 ${count} 组表格。补传 DOCX 可恢复原始排版。`:layout.reason
     return
   }
@@ -258,14 +254,21 @@ function applyTenderLayout(draft,layout,preserveEdits){
     }
     return {...table,kind:'table',source_table_index:table.table_index}
   })
-  const overviewTable=blocks.find(table=>table.caption==='开标一览表')
-  const overviewChapter=draft.sections.find(section=>!section.source_material&&section.title.trim()==='开标一览表')
-  if(overviewTable&&overviewChapter){
-    const savedOverview=(consistent?overviewChapter.blocks||[]:[]).find(block=>block.kind==='table'&&block.source_table_index===overviewTable.source_table_index)
-    if(savedOverview){const oldCells=new Map((savedOverview.rows||[]).flat().map(cell=>[cell.source_cell_index,cell]));for(const cell of overviewTable.rows.flat()){const old=oldCells.get(cell.source_cell_index);if(old&&old.original_text===cell.original_text)cell.text=old.text}}
-    overviewChapter.blocks=[{...overviewTable,caption:''}]
+  const signatureTail=layout.signature_tail
+  let signatureChapter=draft.sections.find(section=>!section.source_material&&section.title.trim()==='投标资质证明')
+  if(signatureTail){
+    if(!signatureChapter){signatureChapter={title:'投标资质证明',blocks:[]};draft.sections.push(signatureChapter)}
+    signatureChapter.chapter_id=undefined
+    signatureChapter.blocks=[{kind:'source_html',text:(signatureTail.text||'').slice(0,100000),html:signatureTail.html,
+      source_element_indices:signatureTail.source_element_indices,source_table_indices:signatureTail.source_table_indices}]
+    const contractTail=[...draft.sections].reverse().find(section=>!section.source_material&&!section.is_cover&&section!==signatureChapter)
+    if(contractTail){
+      contractTail.blocks=contractTail.blocks.filter(block=>block.kind!=='signature')
+      contractTail.blocks.push({kind:'signature',text:'甲方（盖章）：\n\n授权代表（签字）：\n\n\n年  月  日\n\n乙方（盖章）：\n\n法定代表人（签字）：\n\n\n年  月  日'})
+    }
   }
-  const appendixBlocks=overviewTable&&overviewChapter?blocks.filter(table=>table.source_table_index!==overviewTable.source_table_index):blocks
+  const signatureTableIndices=new Set(signatureTail?.source_table_indices||[])
+  const appendixBlocks=blocks.filter(table=>!signatureTableIndices.has(table.source_table_index))
   for(const field of ['header','footer','page_number_format']){
     const templateField=`template_${field}`
     if(!preserveEdits || draft[field]===draft[templateField])draft[field]=layout[field]
@@ -274,7 +277,7 @@ function applyTenderLayout(draft,layout,preserveEdits){
   draft.tender_layout_revision=layout.revision
   draft.sections=draft.sections.filter(section=>!section.source_material)
   if(appendixBlocks.length)draft.sections.push({title:'标书原始表格',source_material:true,blocks:appendixBlocks})
-  tenderFormatNotice.value=overviewTable&&overviewChapter?`已将开标一览表单独放入“${OPENING_OVERVIEW_TITLE}”阶段；其余 ${appendixBlocks.length} 张原表保留在附录。`:blocks.length?`已加载 ${blocks.length} 张标书原始表格。`:'标书已加载，文档正文中没有表格。'
+  tenderFormatNotice.value=signatureTail?`甲乙双方签章栏位于合同正文末尾、资质证明原文之前；资质证明仅在编辑器和导出文件中保留。其余 ${appendixBlocks.length} 张标书表格保留在附录。`:blocks.length?`已加载 ${appendixBlocks.length} 张标书原始表格。`:'标书已加载，文档正文中没有表格。'
 }
 async function openFinalEditor(){
   const project=selected.value
@@ -288,6 +291,11 @@ async function openFinalEditor(){
       page_number_format:project.page_number_format||'第 {page} 页',
       sections:project.chapters.map(ch=>({chapter_id:ch.id,title:ch.title,is_cover:ch.title.includes('封面'),blocks:contentBlocks(ch.content||'【该阶段尚未生成，生成完成后可再次合并】')})),
     }
+    draft.sections=draft.sections.filter(section=>{
+      if(section.title.trim()!=='开标一览表')return true
+      const chapter=project.chapters.find(item=>item.id===section.chapter_id)
+      return !!chapter&&chapter.plan!=='直接展示标书中的开标一览表，不改写或省略表格内容。'
+    })
     draft.cover_title??=project.title
     draft.contract_number??=project.contract_number
     for(const section of draft.sections){
@@ -373,7 +381,7 @@ onMounted(()=>{ if(token.value) loadContracts() }); onUnmounted(()=>clearInterva
       </section>
       <section v-else-if="editorOpen" class="final-editor-workspace">
         <div class="final-editor-layout"><aside class="editor-outline"><div class="outline-heading"><div><span class="eyebrow">DOCUMENT OUTLINE</span><h2>目录</h2></div><span>{{finalDocument?.sections?.length||0}} 节</span></div><div class="outline-tree"><div v-for="(section,index) in finalDocument?.sections||[]" :key="section.chapter_id||index" class="outline-group"><button class="outline-section" :class="{active:activeEditorSection===index}" @click="jumpToEditor(index)"><span class="outline-number">{{String(index+1).padStart(2,'0')}}</span><span>{{section.title}}</span></button><button v-for="(point,pointIndex) in splitKnowledgePoints(selected.chapters.find(ch=>ch.id===section.chapter_id)?.knowledge_points)" :key="pointIndex" class="outline-point" @click="jumpToEditor(index,point)"><span class="outline-tree-elbow">└</span>{{point}}</button></div></div></aside>
-          <main class="editor-main"><div class="word-toolbar"><button class="editor-back" @click="closeFinalEditor"><ArrowLeft :size="16"/>返回</button><span class="editor-document-name"><b>{{selected.title}}</b></span><span class="editor-save-state">{{editorSaving?'保存中…':editorDirty?'有未保存修改':editorSavedAt}}</span><button class="outline-btn editor-save-button" :disabled="editorSaving" @click="saveFinalDocument"><Save :size="14"/>保存</button><button class="primary-btn editor-export-button" :disabled="editorSaving" @click="exportDoc"><Download :size="14"/>导出</button><span class="word-toolbar-label"><FileText :size="15"/>编辑工具</span><button :disabled="activeEditorSection===editorTableIndex" @click="addEditorBlock('paragraph')"><AlignLeft :size="15"/>正文</button><button :disabled="activeEditorSection===editorTableIndex" @click="addEditorBlock('heading')"><Heading1 :size="15"/>标题 1</button><button :disabled="activeEditorSection===editorTableIndex" @click="addEditorBlock('subheading')"><Heading2 :size="15"/>标题 2</button><span class="word-toolbar-hint">点击文档文字即可编辑；标书表格会按原始结构保留</span></div><div class="editor-scroll"><article class="word-paper"><div class="word-page-content"><section v-for="(section,index) in finalDocument.sections" :id="`editor-section-${index}`" :data-editor-section="index" :key="section.chapter_id||`source-${index}`" class="word-section" :class="{'cover-section':section.is_cover,'source-material-section':section.source_material}" @click="activeEditorSection=index"><div class="word-section-kicker">{{section.preview_only?'从旧项目文字识别的表格 · 只读参考':section.source_material?'标书表格 · 原始 Word':section.is_cover?'封面阶段':`阶段 ${String(index).padStart(2,'0')}`}}</div><template v-if="section.is_cover"><input v-model="finalDocument.cover_title" class="word-section-title cover-title" aria-label="编辑封面合同名称"/><input v-model="finalDocument.contract_number" class="cover-contract-number" aria-label="编辑封面合同编号"/></template><h2 v-else-if="section.source_material" class="word-section-title chapter-title-style">{{section.title}}</h2><input v-else v-model="section.title" class="word-section-title chapter-title-style" aria-label="编辑阶段标题"/><div v-if="!section.blocks.length" class="editor-empty-block">此阶段暂时没有文本，可使用上方工具添加内容。</div><template v-for="(block,blockIndex) in section.blocks" :key="blockIndex"><TenderTable v-if="block.kind==='table'" :table="block" :editable="!section.preview_only" fill-gaps @edit="editTableCell" @input="editorDirty=true" /><div v-else class="word-edit-row"><select v-model="block.kind" aria-label="设置段落样式"><option value="paragraph">正文</option><option value="heading">标题 1</option><option value="subheading">标题 2</option></select><div :data-editor-block="blockIndex" contenteditable="true" spellcheck="false" class="word-edit-block" :class="`word-${block.kind}`" :style="blockIndentStyle(block.text)" :data-placeholder="block.kind==='paragraph'?'点击输入正文':''" @blur="updateEditorBlock(section,block,$event)" v-text="block.text"></div></div></template></section></div><label class="word-page-footer"><span>页脚</span><input v-model="finalDocument.footer" placeholder="点击输入页脚" aria-label="编辑页脚"/><span class="page-number-setting"><span>页码格式</span><input v-model="finalDocument.page_number_format" placeholder="第 {page} 页" aria-label="编辑页码格式"/></span></label></article><div class="editor-footnote">原始表格按标书中的表格结构、合并单元格与 Word 样式导出；页码格式中使用 <code>{page}</code> 表示页码。</div></div></main></div>
+          <main class="editor-main"><div class="word-toolbar"><button class="editor-back" @click="closeFinalEditor"><ArrowLeft :size="16"/>返回</button><span class="editor-document-name"><b>{{selected.title}}</b></span><span class="editor-save-state">{{editorSaving?'保存中…':editorDirty?'有未保存修改':editorSavedAt}}</span><button class="outline-btn editor-save-button" :disabled="editorSaving" @click="saveFinalDocument"><Save :size="14"/>保存</button><button class="primary-btn editor-export-button" :disabled="editorSaving" @click="exportDoc"><Download :size="14"/>导出</button><span class="word-toolbar-label"><FileText :size="15"/>编辑工具</span><button :disabled="activeEditorSection===editorTableIndex" @click="addEditorBlock('paragraph')"><AlignLeft :size="15"/>正文</button><button :disabled="activeEditorSection===editorTableIndex" @click="addEditorBlock('heading')"><Heading1 :size="15"/>标题 1</button><button :disabled="activeEditorSection===editorTableIndex" @click="addEditorBlock('subheading')"><Heading2 :size="15"/>标题 2</button><span class="word-toolbar-hint">点击文档文字即可编辑；标书表格会按原始结构保留</span></div><div class="editor-scroll"><article class="word-paper"><div class="word-page-content"><section v-for="(section,index) in finalDocument.sections" :id="`editor-section-${index}`" :data-editor-section="index" :key="section.chapter_id||`source-${index}`" class="word-section" :class="{'cover-section':section.is_cover,'source-material-section':section.source_material}" @click="activeEditorSection=index"><div class="word-section-kicker">{{section.preview_only?'从旧项目文字识别的表格 · 只读参考':section.source_material?'标书表格 · 原始 Word':section.is_cover?'封面阶段':`阶段 ${String(index).padStart(2,'0')}`}}</div><template v-if="section.is_cover"><input v-model="finalDocument.cover_title" class="word-section-title cover-title" aria-label="编辑封面合同名称"/><input v-model="finalDocument.contract_number" class="cover-contract-number" aria-label="编辑封面合同编号"/></template><h2 v-else-if="section.source_material" class="word-section-title chapter-title-style">{{section.title}}</h2><input v-else v-model="section.title" class="word-section-title chapter-title-style" aria-label="编辑阶段标题"/><div v-if="!section.blocks.length" class="editor-empty-block">此阶段暂时没有文本，可使用上方工具添加内容。</div><template v-for="(block,blockIndex) in section.blocks" :key="blockIndex"><div v-if="block.kind==='source_html'" class="source-html-block tender-html-document"><div v-if="block.html" v-html="block.html"></div><div v-else v-html="renderTextHtml(block.text)"></div></div><div v-else-if="block.kind==='signature'" class="signature-block" v-text="block.text"></div><TenderTable v-else-if="block.kind==='table'" :table="block" :editable="!section.preview_only" fill-gaps @edit="editTableCell" @input="editorDirty=true" /><div v-else class="word-edit-row"><select v-model="block.kind" aria-label="设置段落样式"><option value="paragraph">正文</option><option value="heading">标题 1</option><option value="subheading">标题 2</option></select><div :data-editor-block="blockIndex" contenteditable="true" spellcheck="false" class="word-edit-block" :class="`word-${block.kind}`" :style="blockIndentStyle(block.text)" :data-placeholder="block.kind==='paragraph'?'点击输入正文':''" @blur="updateEditorBlock(section,block,$event)" v-text="block.text"></div></div></template></section></div><label class="word-page-footer"><span>页脚</span><input v-model="finalDocument.footer" placeholder="点击输入页脚" aria-label="编辑页脚"/><span class="page-number-setting"><span>页码格式</span><input v-model="finalDocument.page_number_format" placeholder="第 {page} 页" aria-label="编辑页码格式"/></span></label></article><div class="editor-footnote">原始表格按标书中的表格结构、合并单元格与 Word 样式导出；页码格式中使用 <code>{page}</code> 表示页码。</div></div></main></div>
       </section>
       <section v-else class="content detail-content">
         <div class="detail-heading"><div><div class="eyebrow">合同编号 / {{selected.contract_number || String(selected.id).padStart(4,'0')}}</div><h1>{{selected.title}}</h1><p>{{selected.requirements}}</p></div><div class="heading-actions"><span class="status-pill large" :class="statusTone(selected.status)"><i></i>{{stateLabel[selected.status]||selected.status}}</span><details class="action-dropdown" @mouseleave="$event.currentTarget.open=false"><summary>项目操作 <ChevronRight :size="14"/></summary><div class="action-dropdown-panel"><button class="danger-action" @click="deleteProject();closeActionMenu($event)"><Trash2 :size="15"/>删除项目</button></div></details><details class="action-dropdown" @mouseleave="$event.currentTarget.open=false"><summary>流程操作 <ChevronRight :size="14"/></summary><div class="action-dropdown-panel"><button v-if="busy" :disabled="stopLoading" @click="stopWorkflow();closeActionMenu($event)"><Square :size="15"/>停止流程</button><button v-if="canContinue" :disabled="continueLoading" @click="continueWorkflow();closeActionMenu($event)"><Play :size="15"/>继续生成</button><button :disabled="restartLoading" @click="restartAll();closeActionMenu($event)"><RefreshCw :size="15"/>重新开始</button><button :disabled="mergeLoading||!selected.chapters.length" @click="mergeNow();closeActionMenu($event)"><FileText :size="15"/>生成最终文本</button><button v-if="selected.status==='completed'" @click="showVersions();closeActionMenu($event)"><History :size="15"/>历史版本</button></div></details></div></div>
@@ -391,7 +399,7 @@ onMounted(()=>{ if(token.value) loadContracts() }); onUnmounted(()=>clearInterva
         </van-tab>
         <van-tab name="trace">
           <template #title><span>推理过程</span><span v-if="chapterProgress.total" class="tab-progress-bubble">{{chapterProgress.completed}}/{{chapterProgress.total}}</span></template>
-          <section class="trace-section"><div class="trace-heading"><div><div class="eyebrow">WORKFLOW OBSERVABILITY</div><h2>LangGraph 推理与流转</h2><p>记录规划、Send 分发、章节生成与自查，以及全文合并节点的执行状态。</p></div><span class="langgraph-badge large">LangGraph</span></div><div class="planning-inputs-card"><div class="planning-inputs-heading"><div><b>需求拆分输入</b><span>查看 LangGraph 规划节点实际使用的压缩文本</span></div><span class="langgraph-badge">LangGraph</span></div><div class="planning-inputs-grid"><article class="planning-input-item"><div><b>标书文本</b><span>{{selected.tender_filename||'未上传标书'}}</span></div><small>{{selected.tender_compact_text?.length||0}} 字</small><div class="planning-text-actions"><button class="planning-text-button" :disabled="tablePreviewLoading" @click="viewPlanningText('tender')"><FileText :size="14"/>查看拆分文本</button><button class="planning-text-button" :disabled="restoringTenderSource" @click="viewTenderSource"><FileText :size="14"/>{{selected.tender_source_available?'下载源文件':'补传 DOCX'}}</button></div></article><article class="planning-input-item"><div><b>参考文档</b><span>{{selectedReferenceFiles.length?selectedReferenceFiles.join('、'):'未上传参考文档'}}</span></div><small>{{selected.reference_compact_text?.length||0}} 字</small><button class="planning-text-button" :disabled="!selected.reference_compact_text" @click="viewPlanningText('reference')"><FileText :size="14"/>查看参考文本</button></article><article class="planning-input-item"><div><b>额外要求</b><span>{{selected.requirements?.trim()||'未填写额外要求'}}</span></div><small>{{selected.requirements?.length||0}} 字</small><button class="planning-text-button" :disabled="!selected.requirements?.trim()" @click="viewAdditionalRequirements"><FileText :size="14"/>查看额外要求</button></article></div></div><div v-if="recentEvents.length" class="trace-list"><article v-for="event in recentEvents" :key="event.id" class="trace-event" :class="event.status"><span class="trace-dot"></span><div class="trace-main"><div class="trace-title"><b>{{event.node_name}}</b><span class="trace-status">{{event.status==='streaming'?'接口正在返回':event.status==='running'?'执行中':event.status==='failed'?'失败':'完成'}}</span></div><p>{{event.message}}</p><div class="trace-meta"><span v-if="event.model">模型 · {{event.model}}</span><span>{{formatEventDate(event.created_at)}}</span></div></div></article></div><div v-else class="trace-empty">工作流启动后，LangGraph 节点事件会显示在这里。</div></section>
+          <section class="trace-section"><div class="trace-heading"><div><div class="eyebrow">WORKFLOW OBSERVABILITY</div><h2>LangGraph 推理与流转</h2><p>记录规划、Send 分发、章节生成与自查，以及全文合并节点的执行状态。</p></div><span class="langgraph-badge large">LangGraph</span></div><div class="planning-inputs-card"><div class="planning-inputs-heading"><div><b>需求拆分输入</b><span>标书全文转为 HTML 作为拆分推理依据</span></div><span class="langgraph-badge">LangGraph</span></div><div class="planning-inputs-grid"><article class="planning-input-item"><div><b>标书文本</b><span>{{selected.tender_filename||'未上传标书'}}</span></div><small>{{selected.tender_html_length||selected.tender_compact_text?.length||0}} 字 HTML</small><div class="planning-text-actions"><button class="planning-text-button" :disabled="tablePreviewLoading" @click="viewPlanningText('tender')"><FileText :size="14"/>查看拆分文本</button><button class="planning-text-button" :disabled="restoringTenderSource" @click="viewTenderSource"><FileText :size="14"/>{{selected.tender_source_available?'下载源文件':'补传 DOCX'}}</button></div></article><article class="planning-input-item"><div><b>参考文档</b><span>{{selectedReferenceFiles.length?selectedReferenceFiles.join('、'):'未上传参考文档'}}</span></div><small>{{selected.reference_compact_text?.length||0}} 字</small><button class="planning-text-button" :disabled="!selected.reference_compact_text" @click="viewPlanningText('reference')"><FileText :size="14"/>查看参考文本</button></article><article class="planning-input-item"><div><b>额外要求</b><span>{{selected.requirements?.trim()||'未填写额外要求'}}</span></div><small>{{selected.requirements?.length||0}} 字</small><button class="planning-text-button" :disabled="!selected.requirements?.trim()" @click="viewAdditionalRequirements"><FileText :size="14"/>查看额外要求</button></article></div></div><div v-if="recentEvents.length" class="trace-list"><article v-for="event in recentEvents" :key="event.id" class="trace-event" :class="event.status"><span class="trace-dot"></span><div class="trace-main"><div class="trace-title"><b>{{event.node_name}}</b><span class="trace-status">{{event.status==='streaming'?'接口正在返回':event.status==='running'?'执行中':event.status==='failed'?'失败':'完成'}}</span></div><p>{{event.message}}</p><div class="trace-meta"><span v-if="event.model">模型 · {{event.model}}</span><span>{{formatEventDate(event.created_at)}}</span></div></div></article></div><div v-else class="trace-empty">工作流启动后，LangGraph 节点事件会显示在这里。</div></section>
         </van-tab>
         <van-tab name="final">
           <template #title>最终文本</template>
@@ -431,8 +439,9 @@ onMounted(()=>{ if(token.value) loadContracts() }); onUnmounted(()=>clearInterva
         </div>
       </template>
       <details v-if="tablePreview?.showSplitText" class="split-input-details" open>
-        <summary>LangGraph 拆分输入 · {{selected?.tender_compact_text?.length||0}} 字</summary>
-        <div v-if="tablePreview.layout?.split_blocks?.length" class="preview-text-content html-text-preview">
+        <summary>LangGraph 拆分依据 · 完整 HTML · {{tablePreview.layout?.split_html?.length||selected?.tender_compact_text?.length||0}} 字</summary>
+        <div v-if="tablePreview.layout?.split_html" class="preview-text-content html-text-content" v-html="tablePreview.layout.split_html"></div>
+        <div v-else-if="tablePreview.layout?.split_blocks?.length" class="preview-text-content html-text-preview">
           <template v-for="(block,index) in tablePreview.layout.split_blocks" :key="index">
             <div v-if="block.kind==='table'" class="split-preview-inline-table">
               <TenderTable :table="block" fill-gaps/>
