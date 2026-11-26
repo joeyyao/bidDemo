@@ -54,7 +54,8 @@ REVIEW_SYSTEM_PROMPT = long_prompt("""你是合同章节自查节点。请按照
 MERGE_SYSTEM_PROMPT = long_prompt("""你是 LangGraph 的完整合同合并节点。输入章节可能全部完成，也可能仍有阶段正在生成。请根据规划顺序将每章正文合并为一份连续、可阅读的合同文本，保留经节点生成的实质条款、章节标题、层级和编号；统一当事方名称、术语、日期、金额格式和条款引用，修正明显的格式断裂与重复标题。若某一阶段内容是【该阶段尚未生成，生成完成后可再次合并】，必须在对应标题下原样保留此占位标记，不得代写或推测该阶段的合同条款。不得因为追求简短而删除已生成内容中的权利义务、条件、程序或责任，不得新增用户未提出的商业条件或虚构事实。若发现章节间存在无法安全消解的冲突，应保留相关约定并用【需确认：……】标明，不要擅自替用户作选择。将待补充项保留在适当位置。只输出合并后的完整合同正文，不输出过程说明、摘要、检查报告或隐藏推理内容。""")
 
 def ask(system: str, user: str, model: str = DEFAULT_MODEL,
-        retry_callback: Callable[[str, int, int, int], None] | None = None) -> str:
+        retry_callback: Callable[..., None] | None = None,
+        node_key: str = "", phase: str = "") -> str:
     if not settings.dashscope_api_key:
         raise RuntimeError("未配置 DASHSCOPE_API_KEY，无法调用模型网关")
     if model not in MODEL_OPTIONS:
@@ -75,58 +76,106 @@ def ask(system: str, user: str, model: str = DEFAULT_MODEL,
         endpoint = endpoints[(attempt - 1) % len(endpoints)]
         if endpoint.endswith("/responses"):
             payload = {"model": model, "input": [{"role": "system", "content": system_text},
-                                                   {"role": "user", "content": user}], "temperature": 0.1}
+                                                   {"role": "user", "content": user}], "temperature": 0.1,
+                       "stream": True}
         else:
             payload = {"model": model, "messages": [{"role": "system", "content": system_text},
-                                                       {"role": "user", "content": user}], "temperature": 0.1}
+                                                       {"role": "user", "content": user}], "temperature": 0.1,
+                       "stream": True, "stream_options": {"include_usage": True}}
         try:
             timeout = httpx.Timeout(settings.dashscope_timeout_seconds, connect=2000, write=12000, pool=200)
             with httpx.Client(proxy=None, trust_env=False, timeout=timeout) as client:
-                response = client.post(endpoint, headers={"Authorization": f"Bearer {settings.dashscope_api_key}",
-                                                            "Content-Type": "application/json"},
-                                       json=payload)
-            if response.status_code in (400, 404, 405, 408, 415, 422, 429, 500, 502, 503, 504):
+                with client.stream("POST", endpoint,
+                                   headers={"Authorization": f"Bearer {settings.dashscope_api_key}",
+                                            "Content-Type": "application/json", "Accept": "text/event-stream"},
+                                   json=payload) as response:
+                    if response.status_code in (400, 404, 405, 408, 415, 422, 429, 500, 502, 503, 504):
+                        body = response.read().decode("utf-8", "replace")[:600]
+                        status_code = response.status_code
+                    else:
+                        response.raise_for_status()
+                        pieces = []
+                        first_output_reported = False
+                        for line in response.iter_lines():
+                            if not line or not line.startswith("data:"):
+                                continue
+                            raw_event = line[5:].strip()
+                            if raw_event == "[DONE]":
+                                break
+                            try:
+                                event = json.loads(raw_event)
+                            except (ValueError, TypeError):
+                                continue
+                            if endpoint.endswith("/responses"):
+                                event_type = event.get("type", "")
+                                if event_type in ("error", "response.failed", "response.incomplete"):
+                                    error = event.get("error") or event.get("response", {}).get("error") or event
+                                    raise httpx.TransportError(f"模型网关流式响应失败：{str(error)[:400]}")
+                                delta = event.get("delta", "")
+                                is_output = event_type.endswith(".delta") and bool(delta)
+                                if is_output and not first_output_reported and retry_callback:
+                                    try: retry_callback("streaming", attempt, 0, 200, node_key, phase, model)
+                                    except Exception: logging.exception("Gateway streaming progress callback failed")
+                                    first_output_reported = True
+                                if event_type == "response.output_text.delta":
+                                    pieces.append(str(delta))
+                                elif event_type == "response.completed":
+                                    response_object = event.get("response") or {}
+                                    if not pieces:
+                                        text = response_object.get("output_text", "")
+                                        if not text:
+                                            text = "".join(str(part.get("text", ""))
+                                                           for item in response_object.get("output", [])
+                                                           if item.get("type") == "message"
+                                                           for part in item.get("content", [])
+                                                           if part.get("type") in ("output_text", "text"))
+                                        if text:
+                                            pieces.append(text)
+                            else:
+                                if event.get("error"):
+                                    raise httpx.TransportError(f"模型网关流式响应失败：{str(event['error'])[:400]}")
+                                for choice in event.get("choices", []):
+                                    delta = choice.get("delta") or {}
+                                    content = delta.get("content")
+                                    reasoning = delta.get("reasoning_content")
+                                    if (content or reasoning) and not first_output_reported and retry_callback:
+                                        try: retry_callback("streaming", attempt, 0, 200, node_key, phase, model)
+                                        except Exception: logging.exception("Gateway streaming progress callback failed")
+                                        first_output_reported = True
+                                    if isinstance(content, str):
+                                        pieces.append(content)
+                        body = ""
+                        status_code = response.status_code
+                        content = "".join(pieces)
+            if status_code in (400, 404, 405, 408, 415, 422, 429, 500, 502, 503, 504):
                 if attempt <= len(retry_delays):
                     retry_after = response.headers.get("Retry-After", "")
                     delay = min(max(int(retry_after), 1), 30) if retry_after.isdigit() else retry_delays[attempt - 1]
                     if retry_callback:
-                        try: retry_callback("retry", attempt, delay, response.status_code)
+                        try: retry_callback("retry", attempt, delay, status_code, node_key, phase, model)
                         except Exception: logging.exception("Gateway retry progress callback failed")
                     time.sleep(delay)
                     continue
                 if retry_callback:
-                    try: retry_callback("failed", attempt, 0, response.status_code)
+                    try: retry_callback("failed", attempt, 0, status_code, node_key, phase, model)
                     except Exception: logging.exception("Gateway retry progress callback failed")
-            response.raise_for_status()
-            data = response.json()
-            content = data.get("output_text", "") if endpoint.endswith("/responses") else ""
-            if not content and endpoint.endswith("/responses"):
-                pieces = []
-                for item in data.get("output", []):
-                    if item.get("type") != "message":
-                        continue
-                    for part in item.get("content", []):
-                        if part.get("type") in ("output_text", "text"):
-                            pieces.append(str(part.get("text", "")))
-                content = "".join(pieces)
-            if not content and data.get("choices"):
-                content = data["choices"][0]["message"]["content"]
+                raise RuntimeError(f"模型网关返回 HTTP {status_code}：{body}")
             if isinstance(content, list):
                 content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
             if not str(content).strip():
                 if attempt <= len(retry_delays):
                     delay = retry_delays[attempt - 1]
                     if retry_callback:
-                        try: retry_callback("retry", attempt, delay, 0)
+                        try: retry_callback("retry", attempt, delay, 0, node_key, phase, model)
                         except Exception: logging.exception("Gateway retry progress callback failed")
                     time.sleep(delay)
                     continue
                 if retry_callback:
-                    try: retry_callback("failed", attempt, 0, 0)
+                    try: retry_callback("failed", attempt, 0, 0, node_key, phase, model)
                     except Exception: logging.exception("Gateway retry progress callback failed")
                 raise RuntimeError("模型网关返回了空内容")
             if attempt > 1 and retry_callback:
-                try: retry_callback("recovered", attempt, 0, 200)
+                try: retry_callback("recovered", attempt, 0, 200, node_key, phase, model)
                 except Exception: logging.exception("Gateway retry progress callback failed")
             return str(content).strip()
         except httpx.HTTPStatusError as exc:
@@ -136,24 +185,24 @@ def ask(system: str, user: str, model: str = DEFAULT_MODEL,
             if attempt <= len(retry_delays):
                 delay = retry_delays[attempt - 1]
                 if retry_callback:
-                    try: retry_callback("retry", attempt, delay, 0)
+                    try: retry_callback("retry", attempt, delay, 0, node_key, phase, model)
                     except Exception: logging.exception("Gateway retry progress callback failed")
                 time.sleep(delay)
                 continue
             if retry_callback:
-                try: retry_callback("failed", attempt, 0, 0)
+                try: retry_callback("failed", attempt, 0, 0, node_key, phase, model)
                 except Exception: logging.exception("Gateway retry progress callback failed")
             raise RuntimeError(f"模型网关两个接口轮流请求后仍无响应（共 {attempt} 次）：{str(exc)[:400]}") from exc
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             if attempt <= len(retry_delays):
                 delay = retry_delays[attempt - 1]
                 if retry_callback:
-                    try: retry_callback("retry", attempt, delay, 0)
+                    try: retry_callback("retry", attempt, delay, 0, node_key, phase, model)
                     except Exception: logging.exception("Gateway retry progress callback failed")
                 time.sleep(delay)
                 continue
             if retry_callback:
-                try: retry_callback("failed", attempt, 0, 0)
+                try: retry_callback("failed", attempt, 0, 0, node_key, phase, model)
                 except Exception: logging.exception("Gateway retry progress callback failed")
             raise RuntimeError(f"模型网关两个接口轮流请求后仍返回无法识别的响应：{str(exc)[:400]}") from exc
 
@@ -226,13 +275,14 @@ STAGE_DESIGN_PROMPT = long_prompt("""你是合同阶段设计节点。用户已�
 
 def draft_stage(title: str, description: str, contract_title: str, contract_number: str,
                 requirements: str, tender_text: str, reference_text: str, model: str,
-                retry_callback: Callable[[str, int, int, int], None] | None = None) -> dict:
+                retry_callback: Callable[..., None] | None = None) -> dict:
     tender_excerpt = relevant_excerpt(tender_text, title, description, limit=12000) or compact_document_text(tender_text, 12000)
     reference_excerpt = relevant_excerpt(reference_text, title, description, limit=10000) or compact_document_text(reference_text, 10000)
     user_prompt = (f"合同名称：{contract_title}\n合同编号：{contract_number}\n合同核心要求：\n{requirements or '主要依据上传标书'}\n\n"
                    f"阶段名称：{title}\n用户描述：\n{description}\n\n标书相关文本（由已保存的解析文本提取）：\n{tender_excerpt or '未上传标书'}\n\n"
                    f"参考文档相关文本（由已保存的解析文本提取）：\n{reference_excerpt or '未上传参考文档'}")
-    raw = ask(STAGE_DESIGN_PROMPT, user_prompt, model, retry_callback).strip()
+    raw = ask(STAGE_DESIGN_PROMPT, user_prompt, model, retry_callback,
+              node_key=f"stage_design:{title}", phase="阶段计划生成").strip()
     if raw.startswith("```"):
         raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     try:
@@ -332,7 +382,8 @@ def plan_node(state: State):
     prompt = (f"合同名称：{state.get('contract_title', '合同')}\n合同编号：{state.get('contract_number', '【待补充】')}\n"
               f"用户补充要求：\n{state['requirements']}\n\n标书压缩文本（优先以此理解并拆分合同要求）：\n{tender_for_prompt or '未上传标书'}"
               f"{reference_input}")
-    raw = ask(planner_prompt, prompt, model, state.get("retry_callback"))
+    raw = ask(planner_prompt, prompt, model, state.get("retry_callback"),
+              node_key="planner", phase="需求拆解")
     return {"plans": parse_plans(raw, state["requirements"], state["node_models"].get("chapter_default", DEFAULT_MODEL),
                                   state.get("contract_title", "合同"), state.get("contract_number", "【待补充】"), tender, reference)}
 
@@ -362,10 +413,13 @@ def generate_node(state: State):
                      f"本阶段对应参考文本：\n{chapter.get('reference_text', '') or '未提供对应参考段落'}\n\n"
                      f"默认/自定义提示词：\n{chapter['prompt']}\n\n"
                      "起草时以标书和本项目要求为事实依据；参考文本只参照行文风格、条款结构和层级，不复制参考项目事实。")
-    content = ask(CHAPTER_SYSTEM_PROMPT, chapter_input, model, state.get("retry_callback"))
+    callback_key = f"chapter_title:{chapter['title']}"
+    content = ask(CHAPTER_SYSTEM_PROMPT, chapter_input, model, state.get("retry_callback"),
+                  node_key=callback_key, phase="章节正文生成")
     review_input = (f"原始要求：\n{state['requirements']}\n\n章节计划：\n{chapter['plan']}\n\n"
                     f"检查标准：\n{chapter['check_criteria']}\n\n待检查文本：\n{content}")
-    self_check = ask(REVIEW_SYSTEM_PROMPT, review_input, model, state.get("retry_callback"))
+    self_check = ask(REVIEW_SYSTEM_PROMPT, review_input, model, state.get("retry_callback"),
+                     node_key=callback_key, phase="节点自查")
     return {"generated": [{"title": chapter["title"], "content": content,
                             "self_check": self_check, "model": model}]}
 

@@ -106,6 +106,15 @@ def record_event(db: Session, contract_id: int, node_key: str, node_name: str,
                          status=status, message=message, model=model))
     db.commit()
 
+def close_streaming_events(db: Session, contract_id: int, message: str):
+    events = db.scalars(select(WorkflowEvent).where(
+        WorkflowEvent.contract_id == contract_id, WorkflowEvent.status == "streaming")).all()
+    for event in events:
+        event.status = "failed"
+        event.message = f"{event.message} {message}".strip()
+    if events:
+        db.commit()
+
 def is_current_generation(db: Session, contract_id: int, generation_id: str | None) -> bool:
     if not generation_id:
         return True
@@ -113,12 +122,34 @@ def is_current_generation(db: Session, contract_id: int, generation_id: str | No
     return current_id == generation_id
 
 def gateway_progress_callback(contract_id: int, generation_id: str | None = None):
-    def callback(state: str, attempt: int, delay: int, status_code: int):
+    def callback(state: str, attempt: int, delay: int, status_code: int,
+                 node_key: str = "", phase: str = "", model: str = ""):
         progress_db = SessionLocal()
         try:
             if not is_current_generation(progress_db, contract_id, generation_id):
                 return
-            if state == "retry":
+            if state == "streaming":
+                if node_key == "planner":
+                    event_key = "planner"
+                    event_name = "LangGraph · 需求拆解"
+                elif node_key.startswith("chapter_title:"):
+                    title = node_key.removeprefix("chapter_title:")
+                    chapter = progress_db.scalar(select(Chapter).where(
+                        Chapter.contract_id == contract_id, Chapter.title == title,
+                        Chapter.deleted_at.is_(None)))
+                    event_key = f"chapter:{chapter.id}" if chapter else node_key
+                    event_name = f"LangGraph · {chapter.title}" if chapter else f"LangGraph · {title}"
+                elif node_key.startswith("stage_design:"):
+                    title = node_key.removeprefix("stage_design:")
+                    event_key = node_key
+                    event_name = f"LangGraph · 新增阶段「{title}」计划"
+                else:
+                    event_key = node_key or "gateway_stream"
+                    event_name = f"LangGraph · {phase or '模型请求'}"
+                message = f"接口正在返回{phase or '模型生成'}结果（{model or '当前模型'}，第 {attempt} 次请求）。"
+                record_event(progress_db, contract_id, event_key, event_name,
+                             "streaming", message, model)
+            elif state == "retry":
                 reason = f"HTTP {status_code}" if status_code else "接口无响应"
                 next_endpoint = "Responses" if attempt % 2 == 1 else "Chat Completions"
                 message = f"模型网关第 {attempt} 次请求遇到 {reason}；{delay} 秒后切换到 {next_endpoint} 接口重试（两个接口轮流请求，最多 3 次）。"
@@ -131,7 +162,7 @@ def gateway_progress_callback(contract_id: int, generation_id: str | None = None
                 message = f"模型网关两个接口轮流请求 {attempt} 次后仍失败（{reason}），自动重试次数已用尽。"
                 event_status = "failed"
             record_event(progress_db, contract_id, "gateway_retry", "LangGraph · 模型网关重试",
-                         event_status, message)
+                         event_status, message, model)
         finally:
             progress_db.close()
     return callback
@@ -333,6 +364,7 @@ def run_generation(contract_id: int, generation_id: str | None = None):
             return
         if c:
             c.status = "failed"; c.final_check = ""; db.commit()
+            close_streaming_events(db, c.id, "流式请求未完成，工作流已失败。")
             record_event(db, c.id, "workflow", "LangGraph · 流程异常", "failed", str(exc)[:800])
     finally: db.close()
 
@@ -465,6 +497,9 @@ def create_chapter(contract_id: int, data: ChapterCreate, db: Session = Depends(
                              c.requirements, c.tender_text, c.reference_text, model,
                              gateway_progress_callback(c.id, generation_id))
     except Exception as exc:
+        record_event(db, c.id, f"stage_design:{data.title.strip()}",
+                     f"LangGraph · 新增阶段「{data.title.strip()}」计划", "failed",
+                     f"阶段计划生成失败：{str(exc)[:600]}", model)
         raise HTTPException(502, f"阶段自动规划失败：{str(exc)[:500]}") from exc
     if not is_current_generation(db, c.id, generation_id):
         raise HTTPException(409, "全流程已重启，本次新增阶段已取消")

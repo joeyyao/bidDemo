@@ -17,13 +17,17 @@
 .trace-event{position:relative;display:flex;gap:11px;padding:11px 0;border-top:1px solid #f0f2f4}
 .trace-dot{width:8px;height:8px;border-radius:50%;background:#75a88c;margin:4px 0 0 4px;flex:none;box-shadow:0 0 0 3px #edf6f0}
 .trace-event.running .trace-dot{background:#d49a42;box-shadow:0 0 0 3px #fff5e8}
+.trace-event.streaming .trace-dot{background:#557bd0;box-shadow:0 0 0 3px #edf2ff;animation:streaming-pulse 1.2s ease-in-out infinite}
 .trace-event.failed .trace-dot{background:#c85858;box-shadow:0 0 0 3px #fff0ef}
 .trace-main{min-width:0;flex:1}
 .trace-title{display:flex;align-items:center;gap:8px}
 .trace-title b{font-size:11px;color:#3d4a5d}
 .trace-status{font-size:9px;color:#488366;background:#eef7f1;border-radius:8px;padding:3px 7px}
 .trace-event.running .trace-status{color:#a9792e;background:#fff5e8}
+.trace-event.streaming .trace-status{color:#4769b3;background:#edf2ff}
 .trace-event.failed .trace-status{color:#bc5652;background:#fff0ef}
+.streaming-output-notice{display:flex;align-items:center;gap:7px;padding:8px 11px;border:1px solid #dfe8ff;border-radius:8px;background:#f3f6ff;color:#4969ae;font-size:10px;font-weight:600}
+@keyframes streaming-pulse{50%{opacity:.45;box-shadow:0 0 0 6px #edf2ff}}
 .trace-main>p{font-size:10px;line-height:1.65;color:#788492;margin:5px 0}
 .trace-meta{display:flex;gap:13px;color:#a0a8b2;font-size:9px}
 .trace-empty{font-size:10px;color:#9aa3ad;padding:12px 0}
