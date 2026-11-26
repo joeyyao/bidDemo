@@ -10,10 +10,14 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, func, inspect, text
 from io import BytesIO
 from docx import Document
+from docx.shared import Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from .config import settings
 from .database import Base, engine, get_db, SessionLocal
 from .models import User, Contract, Chapter, Version, WorkflowEvent
-from .schemas import Credentials, TokenOut, PromptUpdate, ModelUpdate, StageModelUpdate, ChapterCreate, ChapterTitleUpdate, ChapterOrderUpdate, ModelName
+from .schemas import Credentials, TokenOut, PromptUpdate, ModelUpdate, StageModelUpdate, ChapterCreate, ChapterTitleUpdate, ChapterOrderUpdate, ModelName, FinalDocumentUpdate
 from .auth import hash_password, verify_password, make_token, current_user
 from .generator import workflow, cover_plan, long_prompt, draft_stage, merge_node, normalize_model_text, compact_document_text
 
@@ -29,6 +33,8 @@ with engine.begin() as connection:
         "tender_compact_text": "TEXT NOT NULL DEFAULT ''",
         "reference_filename": "VARCHAR(255) NOT NULL DEFAULT ''", "reference_text": "TEXT NOT NULL DEFAULT ''",
         "reference_compact_text": "TEXT NOT NULL DEFAULT ''",
+        "final_document_json": "TEXT NOT NULL DEFAULT ''", "document_header": "TEXT NOT NULL DEFAULT ''",
+        "document_footer": "TEXT NOT NULL DEFAULT ''", "page_number_format": "VARCHAR(120) NOT NULL DEFAULT '第 {page} 页'",
     }
     for column, definition in contract_migrations.items():
         if column not in contract_columns:
@@ -46,10 +52,14 @@ app.add_middleware(CORSMiddleware, allow_origins=[x.strip() for x in settings.co
 def contract_dict(c: Contract):
     try: node_models = json.loads(c.node_models or "{}")
     except (json.JSONDecodeError, TypeError): node_models = {}
+    try: final_document = json.loads(c.final_document_json or "") or None
+    except (json.JSONDecodeError, TypeError): final_document = None
     return {"id": c.id, "title": c.title, "contract_number": c.contract_number,
             "requirements": c.requirements, "tender_filename": c.tender_filename,
             "reference_filename": c.reference_filename, "status": c.status,
             "final_text": c.final_text, "final_check": c.final_check,
+            "final_document": final_document, "document_header": c.document_header,
+            "document_footer": c.document_footer, "page_number_format": c.page_number_format,
             "node_models": node_models,
             "created_at": c.created_at.isoformat() if c.created_at else None,
             "chapters": [{"id": ch.id, "order": ch.order, "title": ch.title, "knowledge_points": ch.knowledge_points,
@@ -301,6 +311,7 @@ def run_generation(contract_id: int, generation_id: str | None = None):
             if "merge" in update:
                 c.final_text = update["merge"]["final_text"]
                 c.final_check = ""
+                c.final_document_json = ""
                 c.status = "completed"
                 vn = db.scalar(select(func.count(Version.id)).where(Version.contract_id == c.id, Version.chapter_id.is_(None))) or 0
                 db.add(Version(contract_id=c.id, chapter_id=None, version_no=vn+1, content=c.final_text))
@@ -384,7 +395,7 @@ def delete_chapter(contract_id: int, chapter_id: int, db: Session = Depends(get_
     ).order_by(Chapter.order)).all(), start=1):
         active.order = order
     c.generation_id = str(uuid4())
-    c.final_text = ""; c.final_check = ""; c.status = "pending"
+    c.final_text = ""; c.final_document_json = ""; c.final_check = ""; c.status = "pending"
     db.commit()
     record_event(db, c.id, f"chapter_trash:{chapter.id}", f"回收站 · {chapter.title}", "completed", "阶段已移入回收站，可恢复。")
     return {"status": "trashed"}
@@ -428,7 +439,7 @@ def restore_chapter(contract_id: int, chapter_id: int, db: Session = Depends(get
     )) or 0) + 1
     chapter.status = "completed" if chapter.content else "pending"
     c.generation_id = str(uuid4())
-    c.final_text = ""; c.final_check = ""; c.status = "pending"
+    c.final_text = ""; c.final_document_json = ""; c.final_check = ""; c.status = "pending"
     db.commit()
     record_event(db, c.id, f"chapter_restore:{chapter.id}", f"回收站 · {chapter.title}", "completed", "阶段已恢复并添加到阶段列表末尾。")
     return {"status": "restored"}
@@ -467,7 +478,7 @@ def create_chapter(contract_id: int, data: ChapterCreate, db: Session = Depends(
                        check_criteria=design["check_criteria"], prompt=design["prompt"],
                        source_text=design["source_text"], reference_text=design["reference_text"],
                        model=model, status="pending")
-    c.final_text = ""; c.final_check = ""; c.status = "pending"
+    c.final_text = ""; c.final_document_json = ""; c.final_check = ""; c.status = "pending"
     db.add(chapter); db.commit(); db.refresh(chapter)
     record_event(db, c.id, f"chapter:{chapter.id}", f"LangGraph · {chapter.title}", "completed", "模型已自动生成阶段计划、检查标准和提示词；章节正文将在全文生成时起草。", chapter.model)
     return {"id": chapter.id, "order": chapter.order, "title": chapter.title, "description": chapter.description,
@@ -487,7 +498,7 @@ def reorder_chapters(contract_id: int, data: ChapterOrderUpdate, db: Session = D
     by_id = {chapter.id: chapter for chapter in chapters}
     for position, chapter_id in enumerate(data.chapter_ids, start=1):
         by_id[chapter_id].order = position
-    c.final_text = ""; c.final_check = ""; c.status = "pending"
+    c.final_text = ""; c.final_document_json = ""; c.final_check = ""; c.status = "pending"
     db.commit()
     record_event(db, c.id, "stage_order", "LangGraph · 阶段排序", "completed", "用户调整了阶段顺序；下一次全文生成将采用新顺序。")
     return {"chapter_ids": data.chapter_ids}
@@ -516,6 +527,7 @@ def update_chapter_title(contract_id: int, chapter_id: int, data: ChapterTitleUp
     previous_title = chapter.title
     chapter.title = title
     c.final_text = ""
+    c.final_document_json = ""
     c.final_check = ""
     if c.status == "completed":
         c.status = "pending"
@@ -528,7 +540,7 @@ def update_chapter_title(contract_id: int, chapter_id: int, data: ChapterTitleUp
 def generate_again(contract_id: int, tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(current_user)):
     c = owned_contract(db, contract_id, user.id)
     if c.status in ("planning", "generating"): raise HTTPException(409, "该项目正在生成中")
-    c.status = "queued"; c.final_text = ""; c.final_check = ""; c.generation_id = str(uuid4())
+    c.status = "queued"; c.final_text = ""; c.final_document_json = ""; c.final_check = ""; c.generation_id = str(uuid4())
     for chapter in c.chapters:
         if chapter.deleted_at is not None: continue
         chapter.status = "pending"; chapter.content = ""; chapter.self_check = ""
@@ -538,7 +550,7 @@ def generate_again(contract_id: int, tasks: BackgroundTasks, db: Session = Depen
 def restart_all(contract_id: int, tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(current_user)):
     c = owned_contract(db, contract_id, user.id)
     c.generation_id = str(uuid4())
-    c.status = "queued"; c.final_text = ""; c.final_check = ""
+    c.status = "queued"; c.final_text = ""; c.final_document_json = ""; c.final_check = ""
     for chapter in c.chapters:
         if chapter.deleted_at is not None: continue
         chapter.status = "pending"; chapter.content = ""; chapter.self_check = ""
@@ -576,6 +588,7 @@ def continue_workflow(contract_id: int, tasks: BackgroundTasks, db: Session = De
     c.generation_id = str(uuid4())
     c.status = "queued"
     c.final_text = ""
+    c.final_document_json = ""
     c.final_check = ""
     for chapter in chapters:
         chapter.status = "completed" if chapter.content and chapter.self_check else "pending"
@@ -611,6 +624,7 @@ def merge_now(contract_id: int, db: Session = Depends(get_db), user: User = Depe
         raise HTTPException(502, f"直接生成文本失败：{str(exc)[:500]}") from exc
     c.final_text = merged
     c.final_check = ""
+    c.final_document_json = ""
     if all(chapter.content and chapter.self_check for chapter in chapters):
         c.status = "completed"
     version_no = db.scalar(select(func.count(Version.id)).where(Version.contract_id == c.id, Version.chapter_id.is_(None))) or 0
@@ -625,6 +639,23 @@ def update_prompt(contract_id: int, chapter_id: int, data: PromptUpdate, db: Ses
     c = owned_contract(db, contract_id, user.id); ch = db.scalar(select(Chapter).where(Chapter.id == chapter_id, Chapter.contract_id == c.id, Chapter.deleted_at.is_(None)))
     if not ch: raise HTTPException(404, "章节不存在")
     ch.prompt = data.prompt; db.commit(); return {"ok": True}
+
+@app.put("/api/contracts/{contract_id}/final-document")
+def save_final_document(contract_id: int, data: FinalDocumentUpdate,
+                        db: Session = Depends(get_db), user: User = Depends(current_user)):
+    c = owned_contract(db, contract_id, user.id)
+    total_chars = sum(len(block.text) for section in data.sections for block in section.blocks)
+    if total_chars > 500000:
+        raise HTTPException(413, "编辑文本超过 500000 字符")
+    document = data.model_dump(mode="json")
+    c.final_document_json = json.dumps(document, ensure_ascii=False)
+    c.document_header = data.header
+    c.document_footer = data.footer
+    c.page_number_format = data.page_number_format
+    c.final_text = "\n\n".join("\n".join([section.title] + [block.text for block in section.blocks if block.text.strip()])
+                                for section in data.sections)
+    db.commit()
+    return {"ok": True, "saved_at": datetime.now(timezone.utc).isoformat(), "final_document": document}
 
 @app.patch("/api/contracts/{contract_id}/models")
 def update_stage_model(contract_id: int, data: StageModelUpdate, db: Session = Depends(get_db), user: User = Depends(current_user)):
@@ -650,6 +681,7 @@ def generate_chapter(contract_id: int, chapter_id: int, db: Session = Depends(ge
     generation_id = c.generation_id
     c.status = "paused"
     c.final_text = ""
+    c.final_document_json = ""
     c.final_check = ""
     for chapter in c.chapters:
         if chapter.deleted_at is None and chapter.status == "generating":
@@ -690,8 +722,67 @@ def versions(contract_id: int, db: Session = Depends(get_db), user: User = Depen
 def export_contract(contract_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
     c = owned_contract(db, contract_id, user.id)
     if not c.final_text: raise HTTPException(409, "合同尚未生成完成")
-    doc = Document(); doc.add_heading(c.title, 0)
-    for block in c.final_text.split("\n\n"):
-        if block.strip(): doc.add_paragraph(block)
+    try: final_document = json.loads(c.final_document_json or "")
+    except (json.JSONDecodeError, TypeError): final_document = None
+    doc = Document()
+    section = doc.sections[0]
+    section.top_margin = Inches(0.85); section.bottom_margin = Inches(0.85)
+    section.left_margin = Inches(1.0); section.right_margin = Inches(1.0)
+    header_text = (final_document or {}).get("header", c.document_header)
+    footer_text = (final_document or {}).get("footer", c.document_footer)
+    page_format = (final_document or {}).get("page_number_format", c.page_number_format or "第 {page} 页")
+    cover_title = (final_document or {}).get("cover_title", c.title)
+    contract_number = (final_document or {}).get("contract_number", c.contract_number)
+    if header_text:
+        section.header.paragraphs[0].text = header_text
+    footer = section.footer.paragraphs[0]
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    if footer_text:
+        footer.add_run(footer_text + "  ")
+    def append_page_number(paragraph, pattern):
+        chunks = pattern.split("{page}")
+        for index, chunk in enumerate(chunks):
+            if chunk: paragraph.add_run(chunk)
+            if index < len(chunks) - 1:
+                run = OxmlElement("w:r")
+                begin = OxmlElement("w:fldChar"); begin.set(qn("w:fldCharType"), "begin"); run.append(begin); paragraph._p.append(run)
+                instr_run = OxmlElement("w:r"); instr = OxmlElement("w:instrText"); instr.set(qn("xml:space"), "preserve"); instr.text = " PAGE "; instr_run.append(instr); paragraph._p.append(instr_run)
+                separate_run = OxmlElement("w:r"); separate = OxmlElement("w:fldChar"); separate.set(qn("w:fldCharType"), "separate"); separate_run.append(separate); paragraph._p.append(separate_run)
+                value_run = OxmlElement("w:r"); value = OxmlElement("w:t"); value.text = "1"; value_run.append(value); paragraph._p.append(value_run)
+                end_run = OxmlElement("w:r"); end = OxmlElement("w:fldChar"); end.set(qn("w:fldCharType"), "end"); end_run.append(end); paragraph._p.append(end_run)
+    if "{page}" in page_format:
+        append_page_number(footer, page_format)
+    if final_document and final_document.get("sections"):
+        for section_index, item in enumerate(final_document["sections"]):
+            if section_index:
+                doc.add_page_break()
+            is_cover = bool(item.get("is_cover"))
+            title = str(item.get("title") or "未命名阶段")
+            if is_cover:
+                cover_heading = doc.add_heading(cover_title or c.title, level=0)
+                cover_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                if contract_number:
+                    number_paragraph = doc.add_paragraph(contract_number)
+                    number_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            else:
+                doc.add_heading(title, level=1)
+            for block in item.get("blocks", []):
+                text_value = str(block.get("text") or "")
+                if not text_value.strip(): continue
+                kind = block.get("kind")
+                if kind == "heading":
+                    paragraph = doc.add_heading(text_value, level=2)
+                elif kind == "subheading":
+                    paragraph = doc.add_heading(text_value, level=3)
+                else:
+                    paragraph = doc.add_paragraph(text_value)
+                if is_cover:
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        if not final_document["sections"][0].get("is_cover"):
+            doc.core_properties.title = c.title
+    else:
+        doc.add_heading(c.title, 0)
+        for block in c.final_text.split("\n\n"):
+            if block.strip(): doc.add_paragraph(block)
     buff = BytesIO(); doc.save(buff); buff.seek(0)
     return StreamingResponse(buff, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers={"Content-Disposition": f'attachment; filename="contract-{c.id}.docx"'})

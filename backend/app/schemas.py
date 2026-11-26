@@ -30,3 +30,21 @@ class ModelUpdate(BaseModel):
 class StageModelUpdate(BaseModel):
     stage: Literal["planner", "chapter_default"]
     model: ModelName
+
+class FinalDocumentBlock(BaseModel):
+    kind: Literal["heading", "subheading", "paragraph"] = "paragraph"
+    text: str = Field(max_length=100000)
+
+class FinalDocumentSection(BaseModel):
+    chapter_id: int | None = None
+    title: str = Field(max_length=200)
+    is_cover: bool = False
+    blocks: list[FinalDocumentBlock] = Field(default_factory=list, max_length=300)
+
+class FinalDocumentUpdate(BaseModel):
+    header: str = Field(default="", max_length=500)
+    footer: str = Field(default="", max_length=500)
+    page_number_format: str = Field(default="第 {page} 页", max_length=120)
+    cover_title: str = Field(default="", max_length=200)
+    contract_number: str = Field(default="", max_length=120)
+    sections: list[FinalDocumentSection] = Field(min_length=1, max_length=50)
