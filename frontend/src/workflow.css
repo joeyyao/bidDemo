@@ -323,3 +323,5 @@
 .word-paper .word-edit-block.word-paragraph{font-size:10pt;font-weight:400}
 .word-paper .word-edit-table td,.word-paper .word-table-text,.word-paper .word-edit-table-cell{font-size:10pt}
 .word-paper .word-page-meta,.word-paper .word-page-footer,.word-paper .word-page-meta input,.word-paper .word-page-footer input{font-size:10pt}
+.word-paper .word-page-content{padding-top:0}
+.word-paper .word-table-header{font-weight:700}

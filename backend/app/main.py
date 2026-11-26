@@ -1148,7 +1148,7 @@ def export_draft_table(doc, block):
     column_alignments = block.get("column_alignments", [])
     alignments = {"left": WD_ALIGN_PARAGRAPH.LEFT, "center": WD_ALIGN_PARAGRAPH.CENTER, "right": WD_ALIGN_PARAGRAPH.RIGHT}
     for index, row in enumerate(table.rows):
-        is_header = index == 0 and block.get("header_row")
+        is_header = index == 0
         if is_header:
             row._tr.get_or_add_trPr().append(OxmlElement("w:tblHeader"))
         for column, (cell, cell_data) in enumerate(zip(row.cells, rows[index])):
@@ -1192,11 +1192,11 @@ def apply_final_document_format(doc):
         for run in paragraph.runs:
             set_run_format(run, size=size, bold=bold if bold else False)
     for table in doc.tables:
-        for row in table.rows:
+        for row_index, row in enumerate(table.rows):
             for cell in row.cells:
                 for paragraph in cell.paragraphs:
                     for run in paragraph.runs:
-                        set_run_format(run, size=10)
+                        set_run_format(run, size=10, bold=True if row_index == 0 else None)
                 for nested in cell.tables:
                     for nested_row in nested.rows:
                         for nested_cell in nested_row.cells:
@@ -1207,6 +1207,10 @@ def apply_final_document_format(doc):
         for paragraph in part.paragraphs:
             for run in paragraph.runs:
                 set_run_format(run, size=10)
+    for header in doc.sections:
+        for child in list(header.header._element):
+            header.header._element.remove(child)
+        header.header.add_paragraph()
 
 
 @app.get("/api/contracts/{contract_id}/export")
@@ -1236,16 +1240,12 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
     if not template_mode:
         section.top_margin = Inches(0.85); section.bottom_margin = Inches(0.85)
         section.left_margin = Inches(1.0); section.right_margin = Inches(1.0)
-    header_text = (final_document or {}).get("header", c.document_header)
     footer_text = (final_document or {}).get("footer", c.document_footer)
     page_format = (final_document or {}).get("page_number_format", c.page_number_format or "第 {page} 页")
     cover_title = (final_document or {}).get("cover_title", c.title)
     contract_number = (final_document or {}).get("contract_number", c.contract_number)
-    template_header = (final_document or {}).get("template_header", "")
     template_footer = (final_document or {}).get("template_footer", "")
     template_page_format = (final_document or {}).get("template_page_number_format", "")
-    if not template_mode or (template_header == source_page.get("header") and header_text != template_header):
-        section.header.paragraphs[0].text = header_text
     footer = section.footer.paragraphs[0]
     update_footer = not template_mode or (
         template_footer == source_page.get("footer")

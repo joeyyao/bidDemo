@@ -47,7 +47,7 @@ function cellStyle(cell, columnIndex) {
         <col v-for="(width, index) in columnWidths" :key="index" :style="{ width }" />
       </colgroup>
       <tbody>
-        <tr v-for="(row, rowIndex) in rows" :key="rowIndex" :class="{'word-table-header':rowIndex===0&&table.header_row}">
+        <tr v-for="(row, rowIndex) in rows" :key="rowIndex" :class="{'word-table-header':rowIndex===0}">
           <template v-for="(cell, cellIndex) in row" :key="cellIndex">
             <td v-if="cell.display !== false" :colspan="cell.colspan || 1" :rowspan="cell.rowspan || 1" :style="cellStyle(cell, cellIndex)">
               <template v-if="!cell.placeholder">
