@@ -57,22 +57,33 @@ def ask(system: str, user: str, model: str = DEFAULT_MODEL,
         raise RuntimeError("未配置 DASHSCOPE_API_KEY，无法调用模型网关")
     if model not in MODEL_OPTIONS:
         raise RuntimeError(f"不支持的推理模型：{model}")
-    endpoint = settings.dashscope_base_url.rstrip("/")
+    configured_endpoint = settings.dashscope_base_url.rstrip("/")
+    if configured_endpoint.endswith("/chat/completions"):
+        endpoint_root = configured_endpoint.removesuffix("/chat/completions")
+    elif configured_endpoint.endswith("/responses"):
+        endpoint_root = configured_endpoint.removesuffix("/responses")
+    else:
+        endpoint_root = configured_endpoint.rsplit("/", 1)[0]
+    endpoints = [f"{endpoint_root}/chat/completions", f"{endpoint_root}/responses"]
     system_text = long_prompt(system)
     retry_delays = (2, 5)
     attempt = 0
     while True:
         attempt += 1
-        payload = {"model": model, "messages": [{"role": "system", "content": system_text},
-                                                    {"role": "user", "content": user}], "temperature": 0.1}
+        endpoint = endpoints[(attempt - 1) % len(endpoints)]
+        if endpoint.endswith("/responses"):
+            payload = {"model": model, "input": [{"role": "system", "content": system_text},
+                                                   {"role": "user", "content": user}], "temperature": 0.1}
+        else:
+            payload = {"model": model, "messages": [{"role": "system", "content": system_text},
+                                                       {"role": "user", "content": user}], "temperature": 0.1}
         try:
-            proxy = settings.dashscope_proxy or None
             timeout = httpx.Timeout(settings.dashscope_timeout_seconds, connect=20, write=120, pool=20)
-            with httpx.Client(proxy=proxy, trust_env=False, timeout=timeout) as client:
+            with httpx.Client(proxy=None, trust_env=False, timeout=timeout) as client:
                 response = client.post(endpoint, headers={"Authorization": f"Bearer {settings.dashscope_api_key}",
                                                             "Content-Type": "application/json"},
                                        json=payload)
-            if response.status_code in (408, 429, 500, 502, 503, 504):
+            if response.status_code in (400, 404, 405, 408, 415, 422, 429, 500, 502, 503, 504):
                 if attempt <= len(retry_delays):
                     retry_after = response.headers.get("Retry-After", "")
                     delay = min(max(int(retry_after), 1), 30) if retry_after.isdigit() else retry_delays[attempt - 1]
@@ -86,7 +97,18 @@ def ask(system: str, user: str, model: str = DEFAULT_MODEL,
                     except Exception: logging.exception("Gateway retry progress callback failed")
             response.raise_for_status()
             data = response.json()
-            content = data["choices"][0]["message"]["content"]
+            content = data.get("output_text", "") if endpoint.endswith("/responses") else ""
+            if not content and endpoint.endswith("/responses"):
+                pieces = []
+                for item in data.get("output", []):
+                    if item.get("type") != "message":
+                        continue
+                    for part in item.get("content", []):
+                        if part.get("type") in ("output_text", "text"):
+                            pieces.append(str(part.get("text", "")))
+                content = "".join(pieces)
+            if not content and data.get("choices"):
+                content = data["choices"][0]["message"]["content"]
             if isinstance(content, list):
                 content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
             if not str(content).strip():
@@ -119,9 +141,19 @@ def ask(system: str, user: str, model: str = DEFAULT_MODEL,
             if retry_callback:
                 try: retry_callback("failed", attempt, 0, 0)
                 except Exception: logging.exception("Gateway retry progress callback failed")
-            raise RuntimeError(f"模型网关单一接口无响应，已在同一地址重试 {attempt} 次：{str(exc)[:400]}") from exc
+            raise RuntimeError(f"模型网关两个接口轮流请求后仍无响应（共 {attempt} 次）：{str(exc)[:400]}") from exc
         except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"模型网关调用失败：{str(exc)[:400]}") from exc
+            if attempt <= len(retry_delays):
+                delay = retry_delays[attempt - 1]
+                if retry_callback:
+                    try: retry_callback("retry", attempt, delay, 0)
+                    except Exception: logging.exception("Gateway retry progress callback failed")
+                time.sleep(delay)
+                continue
+            if retry_callback:
+                try: retry_callback("failed", attempt, 0, 0)
+                except Exception: logging.exception("Gateway retry progress callback failed")
+            raise RuntimeError(f"模型网关两个接口轮流请求后仍返回无法识别的响应：{str(exc)[:400]}") from exc
 
 def relevant_excerpt(document: str, title: str, knowledge_points: str, limit: int = 5000) -> str:
     if not document:
