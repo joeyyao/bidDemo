@@ -45,6 +45,8 @@ def long_prompt(text: str) -> str:
 
 PLANNER_PROMPT = long_prompt("""你是合同项目的 LangGraph 需求规划节点。优先把用户上传的标书正文作为需求拆分的事实依据，结合用户补充要求识别合同类型、交易目标、主体、标的、履约、交付、验收、价款、期限、权利义务、保密、知识产权、违约、解除和争议解决。上传的参考文档只用于匹配相应章节的行文风格、层级和结构，不得把参考文档中的主体、金额或事实直接冒充为本项目事实。第一个阶段必须是“封面”，包含合同名称和编号。其后按照合同逻辑拆分阶段；每个阶段给出标题、简洁描述、知识点、可执行的生成计划、逐项自查标准、至少500字的详细默认提示词、与当前阶段对应的标书原文摘录 source_text，以及参考文档对应章节的原文摘录 reference_text。请严格从给定上传文本中摘录，不要杜撰引用；没有对应段落时返回空字符串。提示词要明确如何结合标书事实、参考文档的结构与行文风、待补充信息和检查重点。最终只输出合法 JSON 数组，每项字段为 title、description、knowledge_points、plan、check_criteria、prompt、source_text、reference_text；不要输出 Markdown 围栏或数组外文字。""")
 
+PLANNER_NO_REFERENCE_PROMPT = long_prompt("""你是合同项目的 LangGraph 需求规划节点。本项目没有上传参考文档，这是正常输入；不要等待参考文档，不要尝试匹配或推测参考合同结构和文风。只依据用户补充要求和标书压缩文本，先整体理解项目背景、采购目标、标的范围、技术与商务要求、主体职责、实施计划、交付成果、验收标准、价款支付、期限、服务保障、违约责任及其他明确约束，再按标书实际要求拆分合同阶段。不得把标书中未出现的内容写成既定事实；必要但缺失的信息标记为【待补充】。第一个阶段必须是“封面”，包含合同名称和编号。每个阶段应覆盖标书中对应的要求，避免遗漏、重复和凭空增加章节；给出标题、简洁描述、知识点、可执行的生成计划、逐项自查标准、至少500字的详细默认提示词，以及可从标书原文核实的 source_text。由于没有参考文档，每个阶段的 reference_text 必须是空字符串，且各阶段提示词不得要求依赖参考文档。标书没有上传时，改以用户补充要求为拆分依据。最终只输出合法 JSON 数组，每项字段为 title、description、knowledge_points、plan、check_criteria、prompt、source_text、reference_text；不要输出 Markdown 围栏或数组外文字。""")
+
 CHAPTER_SYSTEM_PROMPT = long_prompt("""你是合同章节生成节点，必须使用所选百炼模型根据用户提示词和 LangGraph 规划结果起草当前章节。先核对用户要求、章节计划、知识点和检查标准之间的关系；只写当前节点负责的内容，不能替其他章节擅自作出未授权安排。条款应具体写明主体、行为、时点、条件、协作、交付或验收方式及违约后果中适用的要素。对缺失事实采用【待补充】标识，并用自然、严谨、可签署的中文组织标题和编号。明确区分义务、权利、条件、例外和程序，尽量避免“及时”“尽快”“相关”等无法执行的表达；如确需使用，应说明期限或确认办法。保持金额、日期、术语和主体称谓一致，不得凭空引用法规条文、外部模板或用户未提供的商业承诺。不得输出分析过程，只输出可供合同合并节点使用的章节正文。""")
 
 REVIEW_SYSTEM_PROMPT = long_prompt("""你是合同章节自查节点。请按照给定检查标准逐项核对本节点文本，并结合原始需求、章节知识点和计划，检查遗漏、歧义、前后不一致、无依据事实、主体错配、期限金额缺失、责任失衡、无法操作的条件、错误引用和不合适的重复内容。对于每个发现，说明对应文本或缺项、可能影响以及具体修改建议；没有发现时也要明确说明检查覆盖范围。不能把自查描述成法律意见或签署保证，不能重写其他章节。优先指出会妨碍履行或造成重大争议的事项，再列普通完善建议；所有未知信息仍应保留【待补充】提示。最终输出简明但充分的自查结论和修改建议，不输出隐藏推理链或与本合同无关的说明。""")
@@ -78,7 +80,7 @@ def ask(system: str, user: str, model: str = DEFAULT_MODEL,
             payload = {"model": model, "messages": [{"role": "system", "content": system_text},
                                                        {"role": "user", "content": user}], "temperature": 0.1}
         try:
-            timeout = httpx.Timeout(settings.dashscope_timeout_seconds, connect=20, write=120, pool=20)
+            timeout = httpx.Timeout(settings.dashscope_timeout_seconds, connect=2000, write=12000, pool=200)
             with httpx.Client(proxy=None, trust_env=False, timeout=timeout) as client:
                 response = client.post(endpoint, headers={"Authorization": f"Bearer {settings.dashscope_api_key}",
                                                             "Content-Type": "application/json"},
@@ -320,10 +322,17 @@ def plan_node(state: State):
     reference = state.get("reference_text", "")
     tender_for_prompt = state.get("tender_compact_text") or compact_document_text(tender)
     reference_for_prompt = state.get("reference_compact_text") or compact_document_text(reference, 18000)
+    has_reference = bool(reference_for_prompt.strip())
+    if has_reference:
+        planner_prompt = PLANNER_PROMPT
+        reference_input = f"\n\n参考文档压缩文本（只用于对应章节的结构与文风）：\n{reference_for_prompt}"
+    else:
+        planner_prompt = PLANNER_NO_REFERENCE_PROMPT
+        reference_input = "\n\n本项目未上传参考文档；请直接按标书拆分，所有阶段的 reference_text 留空。"
     prompt = (f"合同名称：{state.get('contract_title', '合同')}\n合同编号：{state.get('contract_number', '【待补充】')}\n"
-              f"用户补充要求：\n{state['requirements']}\n\n标书压缩文本（以此作为拆分依据）：\n{tender_for_prompt or '未上传标书'}\n\n"
-              f"参考文档压缩文本（只用于对应章节的结构与文风）：\n{reference_for_prompt or '未上传参考文档'}")
-    raw = ask(PLANNER_PROMPT, prompt, model, state.get("retry_callback"))
+              f"用户补充要求：\n{state['requirements']}\n\n标书压缩文本（优先以此理解并拆分合同要求）：\n{tender_for_prompt or '未上传标书'}"
+              f"{reference_input}")
+    raw = ask(planner_prompt, prompt, model, state.get("retry_callback"))
     return {"plans": parse_plans(raw, state["requirements"], state["node_models"].get("chapter_default", DEFAULT_MODEL),
                                   state.get("contract_title", "合同"), state.get("contract_number", "【待补充】"), tender, reference)}
 

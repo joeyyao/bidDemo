@@ -239,7 +239,10 @@ def run_generation(contract_id: int, generation_id: str | None = None):
                                  "章节生成和自查节点开始执行。", chapter.model)
         else:
             record_event(db, c.id, "planner", "LangGraph · 需求拆解", "running",
-                         "读取合同要求与已上传文件，规划带有对应标书和参考文本的阶段节点。", node_models["planner"])
+                         ("正在理解标书与用户要求并拆分阶段；参考文档未上传，已跳过参考匹配。"
+                          if not c.reference_text else
+                          "正在理解标书与用户要求并拆分阶段，同时匹配参考文档中的章节结构与行文风格。"),
+                         node_models["planner"])
             plans = None
             plan_count = 0
         state = {"requirements": c.requirements, "node_models": node_models,
