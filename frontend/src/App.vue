@@ -4,11 +4,20 @@ import { showToast, showConfirmDialog } from 'vant'
 import { FileText, Plus, LogOut, ArrowLeft, ChevronRight, Sparkles, Download, History, RefreshCw, CheckCircle2, Circle, LoaderCircle, Pencil, ShieldCheck, GripVertical, Upload, Trash2, Archive, Square, Play, Check, X, Save, Heading1, Heading2, AlignLeft, LayoutGrid, List } from 'lucide-vue-next'
 import api from './api'
 import TenderTable from './TenderTable.vue'
-import { contentBlocks, previewHeading, restoreDraftTables } from './documentBlocks'
+import { contentBlocks, normalizeNumberedBlocks, previewHeading } from './documentBlocks'
 
 const token = ref(localStorage.getItem('contract_token') || '')
 const username = ref(localStorage.getItem('contract_user') || '')
 const mode = ref('login'), loading = ref(false), mergeLoading = ref(false), restartLoading = ref(false), stopLoading = ref(false), continueLoading = ref(false), contracts = ref([]), selected = ref(null), versions = ref([]), showTrash = ref(false)
+const projectQuery = ref(''), projectStatusFilter = ref('')
+const filteredContracts = computed(() => {
+  const query = projectQuery.value.trim().toLocaleLowerCase('zh-CN')
+  return contracts.value.filter(contract => {
+    const matchesQuery = !query || [contract.title, contract.contract_number]
+      .some(value => String(value || '').toLocaleLowerCase('zh-CN').includes(query))
+    return matchesQuery && (!projectStatusFilter.value || contract.status === projectStatusFilter.value)
+  })
+})
 const recycleBin = ref({ projects: [], chapters: [] })
 const modelOptions = ['qwen3.8-flash', 'qwen3.8-max']
 const form = ref({ username: '', password: '' }), newForm = ref({ title: '', contract_number: '', requirements: '', planner_model: 'qwen3.8-flash', chapter_model: 'qwen3.8-flash' })
@@ -23,6 +32,7 @@ const detailTab = ref('content')
 const projectListView = ref('cards')
 const chapterRetrying = ref([])
 const addingStage = ref(false)
+const OPENING_OVERVIEW_TITLE = '开标一览表'
 const planningTextPreview = ref(null)
 const editorOpen = ref(false), finalDocument = ref(null), editorSaving = ref(false), editorSavedAt = ref(''), editorDirty = ref(false), activeEditorSection = ref(0)
 const tenderFormatNotice = ref('')
@@ -129,10 +139,10 @@ async function restoreTenderSource(event){
     if(selected.value?.id!==id)return
     selected.value.tender_source_available=true
     selected.value.tender_source_filename=layout.filename
+    if(layout.tender_compact_text)selected.value.tender_compact_text=layout.tender_compact_text
     const preview=tablePreview.value
     if(preview?.id===id){
-      let splitBlocks=preview.layout?.split_blocks
-      if(preview.showSplitText&&splitBlocks==null)splitBlocks=(await readTenderLayout(id,true)).split_blocks
+      const splitBlocks=preview.showSplitText?(await readTenderLayout(id,true)).split_blocks:preview.layout?.split_blocks
       if(tablePreview.value===preview)preview.layout={...layout,split_blocks:splitBlocks}
     }
     if(editorOpen.value){
@@ -197,6 +207,13 @@ async function savePrompt(){ try { await api.patch(`/contracts/${selected.value.
 async function generateChapter(ch){ if(chapterRetrying.value.includes(ch.id))return;chapterRetrying.value=[...chapterRetrying.value,ch.id];const contractId=selected.value.id;ch.status='generating';startPolling(true);try{await api.post(`/contracts/${contractId}/chapters/${ch.id}/generate`);await openContract(contractId);showToast('章节已重新生成；流程已暂停，可继续生成其余节点')}catch(e){ch.status='failed';showToast(e.message)}finally{clearInterval(poller);chapterRetrying.value=chapterRetrying.value.filter(id=>id!==ch.id)} }
 async function showVersions(){ try { versions.value=(await api.get(`/contracts/${selected.value.id}/versions`)).data; showHistory.value=true } catch(e){showToast(e.message)} }
 function splitKnowledgePoints(value){return (value||'').split(/[，,、；;\n]/).map(point=>point.trim()).filter(Boolean)}
+function blockIndentStyle(value){
+  const text=(value||'').trim()
+  const parenthesized=/^[（(](?:\d+|[一二三四五六七八九十]+)[）)]/.test(text)
+  const numbered=text.match(/^(\d+(?:\.\d+)+)(?=[、.．\s]|$)/)
+  const depth=parenthesized?1:numbered?numbered[1].split('.').length-1:0
+  return depth?{marginLeft:`${depth*2}em`,textIndent:'2em'}:{}
+}
 function renderTextHtml(value){
   const escapeHtml=text=>String(text||'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]))
   const lines=String(value||'').split(/\r?\n/),out=[],tables=[]
@@ -220,10 +237,13 @@ function applyTenderLayout(draft,layout,preserveEdits){
   draft.sections=draft.sections.filter(section=>!section.preview_only)
   if(!layout.supported){
     const count=layout.tables.length
-    if(count && !draft.sections.some(section=>section.source_material)){
-      const blocks=layout.tables.map(table=>({...table,kind:'table'}))
-      draft.sections.push({title:'标书表格参考',source_material:true,preview_only:true,blocks})
-    }
+    const blocks=layout.tables.map(table=>({...table,kind:'table'}))
+    const overviewTable=blocks.find(table=>table.caption==='开标一览表')
+    const overviewChapter=draft.sections.find(section=>!section.source_material&&section.title.trim()===OPENING_OVERVIEW_TITLE)
+    if(overviewTable&&overviewChapter)overviewChapter.blocks=[{...overviewTable,caption:''}]
+    const appendixBlocks=overviewTable&&overviewChapter?blocks.filter(table=>table.table_index!==overviewTable.table_index):blocks
+    draft.sections=draft.sections.filter(section=>!section.source_material)
+    if(appendixBlocks.length)draft.sections.push({title:'标书表格参考',source_material:true,preview_only:true,blocks:appendixBlocks})
     tenderFormatNotice.value=count?`编辑区已显示从旧项目文字识别的 ${count} 组表格。补传 DOCX 可恢复原始排版。`:layout.reason
     return
   }
@@ -238,6 +258,14 @@ function applyTenderLayout(draft,layout,preserveEdits){
     }
     return {...table,kind:'table',source_table_index:table.table_index}
   })
+  const overviewTable=blocks.find(table=>table.caption==='开标一览表')
+  const overviewChapter=draft.sections.find(section=>!section.source_material&&section.title.trim()==='开标一览表')
+  if(overviewTable&&overviewChapter){
+    const savedOverview=(consistent?overviewChapter.blocks||[]:[]).find(block=>block.kind==='table'&&block.source_table_index===overviewTable.source_table_index)
+    if(savedOverview){const oldCells=new Map((savedOverview.rows||[]).flat().map(cell=>[cell.source_cell_index,cell]));for(const cell of overviewTable.rows.flat()){const old=oldCells.get(cell.source_cell_index);if(old&&old.original_text===cell.original_text)cell.text=old.text}}
+    overviewChapter.blocks=[{...overviewTable,caption:''}]
+  }
+  const appendixBlocks=overviewTable&&overviewChapter?blocks.filter(table=>table.source_table_index!==overviewTable.source_table_index):blocks
   for(const field of ['header','footer','page_number_format']){
     const templateField=`template_${field}`
     if(!preserveEdits || draft[field]===draft[templateField])draft[field]=layout[field]
@@ -245,8 +273,8 @@ function applyTenderLayout(draft,layout,preserveEdits){
   }
   draft.tender_layout_revision=layout.revision
   draft.sections=draft.sections.filter(section=>!section.source_material)
-  if(blocks.length)draft.sections.push({title:'标书原始表格',source_material:true,blocks})
-  tenderFormatNotice.value=blocks.length?`已加载 ${blocks.length} 张标书原始表格。`:'标书已加载，文档正文中没有表格。'
+  if(appendixBlocks.length)draft.sections.push({title:'标书原始表格',source_material:true,blocks:appendixBlocks})
+  tenderFormatNotice.value=overviewTable&&overviewChapter?`已将开标一览表单独放入“${OPENING_OVERVIEW_TITLE}”阶段；其余 ${appendixBlocks.length} 张原表保留在附录。`:blocks.length?`已加载 ${blocks.length} 张标书原始表格。`:'标书已加载，文档正文中没有表格。'
 }
 async function openFinalEditor(){
   const project=selected.value
@@ -263,7 +291,7 @@ async function openFinalEditor(){
     draft.cover_title??=project.title
     draft.contract_number??=project.contract_number
     for(const section of draft.sections){
-      if(!section.source_material)section.blocks=restoreDraftTables(section.blocks)
+      if(!section.source_material)section.blocks=normalizeNumberedBlocks(section.blocks)
     }
     const layout=await readTenderLayout(project.id)
     if(selected.value?.id!==project.id)return
@@ -333,21 +361,19 @@ onMounted(()=>{ if(token.value) loadContracts() }); onUnmounted(()=>clearInterva
       </section>
     </template>
     <template v-else>
-      <header class="topbar"><div class="brand"><div class="brand-mark small"><FileText :size="18"/></div><b>smartBidding</b><button v-if="selected&&!editorOpen" class="project-home-link" @click="backToProjects"><ArrowLeft :size="14"/>返回所有项目</button></div><div class="user-area"><span class="user-avatar">{{username.slice(0,1).toUpperCase()}}</span><span class="user-name">{{username}}</span><button class="icon-button" title="退出登录" @click="logout"><LogOut :size="17"/></button></div></header>
-      <section v-if="!selected" class="content">
+      <header v-if="!editorOpen" class="topbar"><div class="brand"><div class="brand-mark small"><FileText :size="18"/></div><b>smartBidding</b><button v-if="selected&&!editorOpen" class="project-home-link" @click="backToProjects"><ArrowLeft :size="14"/>返回所有项目</button></div><div class="user-area"><span class="user-avatar">{{username.slice(0,1).toUpperCase()}}</span><span class="user-name">{{username}}</span><button class="icon-button" title="退出登录" @click="logout"><LogOut :size="17"/></button></div></header>
+      <section v-if="!selected" class="content" style="padding-top:20px" >
         <div class="page-heading"><div><div class="eyebrow">WORKSPACE / CONTRACTS</div><h1>合同项目</h1><p>管理起草任务，跟踪每个章节的生成进度。</p></div><div class="page-heading-actions"><van-button class="outline-btn" round @click="openTrash"><Archive :size="16"/>回收站</van-button><van-button class="primary-btn" round @click="showCreate=true"><Plus :size="17"/>新建合同</van-button></div></div>
         <div class="stats-row"><div class="stat-card"><span>全部项目</span><b>{{contracts.length}}</b><small>已创建合同任务</small></div><div class="stat-card"><span>生成中</span><b>{{contracts.filter(c=>['queued','planning','generating'].includes(c.status)).length}}</b><small>正在处理的任务</small></div><div class="stat-card"><span>已完成</span><b>{{contracts.filter(c=>c.status==='completed').length}}</b><small>可查看或导出</small></div></div>
-        <div class="section-head"><div><h2>项目列表</h2><span>{{contracts.length}} 个项目</span></div><div class="project-list-actions"><div class="view-toggle" role="group" aria-label="项目显示方式"><button :class="{active:projectListView==='cards'}" :aria-pressed="projectListView==='cards'" title="卡片视图" @click="projectListView='cards'"><LayoutGrid :size="15"/><span>卡片</span></button><button :class="{active:projectListView==='table'}" :aria-pressed="projectListView==='table'" title="表格视图" @click="projectListView='table'"><List :size="15"/><span>表格</span></button></div><button class="text-button" @click="loadContracts"><RefreshCw :size="14"/>刷新</button></div></div>
-        <template v-if="contracts.length"><div v-if="projectListView==='cards'" class="project-grid"><button v-for="c in contracts" :key="c.id" class="project-card" @click="openContract(c.id)"><div class="project-icon"><FileText :size="20"/></div><div class="project-title-row"><h3>{{c.title}}</h3><span class="status-pill" :class="statusTone(c.status)"><i></i>{{stateLabel[c.status]||c.status}}</span></div><p class="project-meta">{{c.contract_number}} <span>·</span> {{c.chapter_count}} 个阶段 <span>·</span> {{formatProjectDate(c.created_at)}}</p><div class="project-bottom"><span>打开项目</span><ChevronRight :size="16"/></div></button></div><div v-else class="project-table-wrap"><table class="project-table"><thead><tr><th>项目名称</th><th>合同编号</th><th>状态</th><th>阶段数</th><th>创建时间</th><th></th></tr></thead><tbody><tr v-for="c in contracts" :key="c.id"><td><button class="project-table-title" @click="openContract(c.id)"><FileText :size="16"/>{{c.title}}</button></td><td>{{c.contract_number||'—'}}</td><td><span class="status-pill" :class="statusTone(c.status)"><i></i>{{stateLabel[c.status]||c.status}}</span></td><td>{{c.chapter_count}}</td><td>{{formatProjectDate(c.created_at)}}</td><td><button class="project-table-open" @click="openContract(c.id)">打开项目 <ChevronRight :size="14"/></button></td></tr></tbody></table></div></template>
+        <div class="section-head"><div><h2>项目列表</h2><span>显示 {{filteredContracts.length}} / {{contracts.length}} 个项目</span></div><div class="project-list-actions"><div class="view-toggle" role="group" aria-label="项目显示方式"><button :class="{active:projectListView==='cards'}" :aria-pressed="projectListView==='cards'" title="卡片视图" @click="projectListView='cards'"><LayoutGrid :size="15"/><span>卡片</span></button><button :class="{active:projectListView==='table'}" :aria-pressed="projectListView==='table'" title="表格视图" @click="projectListView='table'"><List :size="15"/><span>表格</span></button></div><button class="text-button" @click="loadContracts"><RefreshCw :size="14"/>刷新</button></div></div>
+        <div class="project-filters"><label class="project-status-filter"><span>状态</span><select v-model="projectStatusFilter" aria-label="按项目状态筛选"><option value="">全部状态</option><option v-for="(label,status) in stateLabel" :key="status" :value="status">{{label}}</option></select></label><label class="project-search"><FileText :size="16"/><input v-model="projectQuery" type="search" placeholder="搜索项目名称或合同编号" aria-label="搜索项目名称或合同编号"/><button v-if="projectQuery" title="清空搜索" @click="projectQuery=''"><X :size="14"/></button></label><button v-if="projectQuery||projectStatusFilter" class="text-button clear-project-filters" @click="projectQuery='';projectStatusFilter=''"><X :size="14"/>清除筛选</button></div>
+        <template v-if="filteredContracts.length"><div v-if="projectListView==='cards'" class="project-grid"><button v-for="c in filteredContracts" :key="c.id" class="project-card" @click="openContract(c.id)"><div class="project-icon"><FileText :size="20"/></div><div class="project-title-row"><h3>{{c.title}}</h3><span class="status-pill" :class="statusTone(c.status)"><i></i>{{stateLabel[c.status]||c.status}}</span></div><p class="project-meta">{{c.contract_number}} <span>·</span> {{c.chapter_count}} 个阶段 <span>·</span> {{formatProjectDate(c.created_at)}}</p><div class="project-bottom"><span>打开项目</span><ChevronRight :size="16"/></div></button></div><div v-else class="project-table-wrap"><table class="project-table"><thead><tr><th>项目名称</th><th>合同编号</th><th>状态</th><th>阶段数</th><th>创建时间</th><th></th></tr></thead><tbody><tr v-for="c in filteredContracts" :key="c.id"><td><button class="project-table-title" @click="openContract(c.id)"><FileText :size="16"/>{{c.title}}</button></td><td>{{c.contract_number||'—'}}</td><td><span class="status-pill" :class="statusTone(c.status)"><i></i>{{stateLabel[c.status]||c.status}}</span></td><td>{{c.chapter_count}}</td><td>{{formatProjectDate(c.created_at)}}</td><td><button class="project-table-open" @click="openContract(c.id)">打开项目 <ChevronRight :size="14"/></button></td></tr></tbody></table></div></template>
+        <div v-else-if="contracts.length" class="empty-state project-filter-empty"><div class="empty-icon"><FileText :size="25"/></div><h3>没有找到符合条件的项目</h3><p>试试修改名称、合同编号或状态筛选条件。</p><button class="text-button" @click="projectQuery='';projectStatusFilter=''"><X :size="14"/>清除筛选</button></div>
         <div v-else class="empty-state"><div class="empty-icon"><FileText :size="25"/></div><h3>开始你的第一个合同项目</h3><p>描述合作背景和核心约定，AI 会为你拆解章节并逐步起草。</p><van-button class="primary-btn" round @click="showCreate=true"><Plus :size="17"/>新建合同</van-button></div>
       </section>
       <section v-else-if="editorOpen" class="final-editor-workspace">
-        <div class="editor-header-group">
-          <header class="final-editor-bar"><button class="editor-back" @click="closeFinalEditor"><ArrowLeft :size="17"/>返回项目</button><div class="editor-document-name"><b>{{selected.title}}</b><span>合同最终编辑</span></div><span class="editor-save-state">{{editorSaving?'保存中…':editorDirty?'有未保存修改':editorSavedAt}}</span><button class="outline-btn editor-save-button" :disabled="editorSaving" @click="saveFinalDocument"><Save :size="15"/>临时保存</button><button class="primary-btn editor-export-button" :disabled="editorSaving" @click="exportDoc"><Download :size="15"/>导出 Word</button></header>
-          <div class="editor-source-status"><div class="source-status-item" :class="{'source-skipped':!selected.tender_filename}"><CheckCircle2 v-if="selected.tender_filename" :size="15"/><Circle v-else :size="15"/><b>标书文本解析</b><span>{{selected.tender_filename?'已读取保存的标书文本':'未上传标书，已跳过'}}</span><em>{{selected.tender_filename?'完成':'跳过'}}</em></div><div class="source-status-item" :class="{'source-skipped':!selected.reference_filename}"><CheckCircle2 v-if="selected.reference_filename" :size="15"/><Circle v-else :size="15"/><b>参考文本解析</b><span>{{selectedReferenceFiles.length?`已读取保存 ${selectedReferenceFiles.length} 个参考文档`:'未上传参考文档，已跳过'}}</span><em>{{selected.reference_filename?'完成':'跳过'}}</em></div><div class="source-format-notice"><b>最终文本格式</b><span>{{tenderFormatNotice}}</span><button class="planning-text-button" @click="editorTableIndex>=0?jumpToEditor(editorTableIndex):showTenderTables()"><FileText :size="14"/>{{editorTableIndex>=0?'定位表格':'预览 / 补传标书表格'}}</button><button v-if="editorTableIndex>=0&&!hasOriginalEditorTables" class="planning-text-button" @click="showTenderTables()"><Upload :size="14"/>补传原始 DOCX</button></div></div>
-        </div>
         <div class="final-editor-layout"><aside class="editor-outline"><div class="outline-heading"><div><span class="eyebrow">DOCUMENT OUTLINE</span><h2>目录</h2></div><span>{{finalDocument?.sections?.length||0}} 节</span></div><div class="outline-tree"><div v-for="(section,index) in finalDocument?.sections||[]" :key="section.chapter_id||index" class="outline-group"><button class="outline-section" :class="{active:activeEditorSection===index}" @click="jumpToEditor(index)"><span class="outline-number">{{String(index+1).padStart(2,'0')}}</span><span>{{section.title}}</span></button><button v-for="(point,pointIndex) in splitKnowledgePoints(selected.chapters.find(ch=>ch.id===section.chapter_id)?.knowledge_points)" :key="pointIndex" class="outline-point" @click="jumpToEditor(index,point)"><span class="outline-tree-elbow">└</span>{{point}}</button></div></div></aside>
-          <main class="editor-main"><div class="word-toolbar"><span class="word-toolbar-label"><FileText :size="15"/>编辑工具</span><button :disabled="activeEditorSection===editorTableIndex" @click="addEditorBlock('paragraph')"><AlignLeft :size="15"/>正文</button><button :disabled="activeEditorSection===editorTableIndex" @click="addEditorBlock('heading')"><Heading1 :size="15"/>标题 1</button><button :disabled="activeEditorSection===editorTableIndex" @click="addEditorBlock('subheading')"><Heading2 :size="15"/>标题 2</button><span class="word-toolbar-hint">点击文档文字即可编辑；标书表格会按原始结构保留</span></div><div class="editor-scroll"><article class="word-paper"><div class="word-page-content"><section v-for="(section,index) in finalDocument.sections" :id="`editor-section-${index}`" :data-editor-section="index" :key="section.chapter_id||`source-${index}`" class="word-section" :class="{'cover-section':section.is_cover,'source-material-section':section.source_material}" @click="activeEditorSection=index"><div class="word-section-kicker">{{section.preview_only?'从旧项目文字识别的表格 · 只读参考':section.source_material?'标书表格 · 原始 Word':section.is_cover?'封面阶段':`阶段 ${String(index).padStart(2,'0')}`}}</div><template v-if="section.is_cover"><input v-model="finalDocument.cover_title" class="word-section-title cover-title" aria-label="编辑封面合同名称"/><input v-model="finalDocument.contract_number" class="cover-contract-number" aria-label="编辑封面合同编号"/></template><h2 v-else-if="section.source_material" class="word-section-title chapter-title-style">{{section.title}}</h2><input v-else v-model="section.title" class="word-section-title chapter-title-style" aria-label="编辑阶段标题"/><div v-if="!section.blocks.length" class="editor-empty-block">此阶段暂时没有文本，可使用上方工具添加内容。</div><template v-for="(block,blockIndex) in section.blocks" :key="blockIndex"><TenderTable v-if="block.kind==='table'" :table="block" :editable="!section.preview_only" fill-gaps @edit="editTableCell" @input="editorDirty=true" /><div v-else class="word-edit-row"><select v-model="block.kind" aria-label="设置段落样式"><option value="paragraph">正文</option><option value="heading">标题 1</option><option value="subheading">标题 2</option></select><div :data-editor-block="blockIndex" contenteditable="true" spellcheck="false" class="word-edit-block" :class="`word-${block.kind}`" :data-placeholder="block.kind==='paragraph'?'点击输入正文':''" @blur="updateEditorBlock(section,block,$event)" v-text="block.text"></div></div></template></section></div><label class="word-page-footer"><span>页脚</span><input v-model="finalDocument.footer" placeholder="点击输入页脚" aria-label="编辑页脚"/><span class="page-number-setting"><span>页码格式</span><input v-model="finalDocument.page_number_format" placeholder="第 {page} 页" aria-label="编辑页码格式"/></span></label></article><div class="editor-footnote">原始表格按标书中的表格结构、合并单元格与 Word 样式导出；页码格式中使用 <code>{page}</code> 表示页码。</div></div></main></div>
+          <main class="editor-main"><div class="word-toolbar"><button class="editor-back" @click="closeFinalEditor"><ArrowLeft :size="16"/>返回</button><span class="editor-document-name"><b>{{selected.title}}</b></span><span class="editor-save-state">{{editorSaving?'保存中…':editorDirty?'有未保存修改':editorSavedAt}}</span><button class="outline-btn editor-save-button" :disabled="editorSaving" @click="saveFinalDocument"><Save :size="14"/>保存</button><button class="primary-btn editor-export-button" :disabled="editorSaving" @click="exportDoc"><Download :size="14"/>导出</button><span class="word-toolbar-label"><FileText :size="15"/>编辑工具</span><button :disabled="activeEditorSection===editorTableIndex" @click="addEditorBlock('paragraph')"><AlignLeft :size="15"/>正文</button><button :disabled="activeEditorSection===editorTableIndex" @click="addEditorBlock('heading')"><Heading1 :size="15"/>标题 1</button><button :disabled="activeEditorSection===editorTableIndex" @click="addEditorBlock('subheading')"><Heading2 :size="15"/>标题 2</button><span class="word-toolbar-hint">点击文档文字即可编辑；标书表格会按原始结构保留</span></div><div class="editor-scroll"><article class="word-paper"><div class="word-page-content"><section v-for="(section,index) in finalDocument.sections" :id="`editor-section-${index}`" :data-editor-section="index" :key="section.chapter_id||`source-${index}`" class="word-section" :class="{'cover-section':section.is_cover,'source-material-section':section.source_material}" @click="activeEditorSection=index"><div class="word-section-kicker">{{section.preview_only?'从旧项目文字识别的表格 · 只读参考':section.source_material?'标书表格 · 原始 Word':section.is_cover?'封面阶段':`阶段 ${String(index).padStart(2,'0')}`}}</div><template v-if="section.is_cover"><input v-model="finalDocument.cover_title" class="word-section-title cover-title" aria-label="编辑封面合同名称"/><input v-model="finalDocument.contract_number" class="cover-contract-number" aria-label="编辑封面合同编号"/></template><h2 v-else-if="section.source_material" class="word-section-title chapter-title-style">{{section.title}}</h2><input v-else v-model="section.title" class="word-section-title chapter-title-style" aria-label="编辑阶段标题"/><div v-if="!section.blocks.length" class="editor-empty-block">此阶段暂时没有文本，可使用上方工具添加内容。</div><template v-for="(block,blockIndex) in section.blocks" :key="blockIndex"><TenderTable v-if="block.kind==='table'" :table="block" :editable="!section.preview_only" fill-gaps @edit="editTableCell" @input="editorDirty=true" /><div v-else class="word-edit-row"><select v-model="block.kind" aria-label="设置段落样式"><option value="paragraph">正文</option><option value="heading">标题 1</option><option value="subheading">标题 2</option></select><div :data-editor-block="blockIndex" contenteditable="true" spellcheck="false" class="word-edit-block" :class="`word-${block.kind}`" :style="blockIndentStyle(block.text)" :data-placeholder="block.kind==='paragraph'?'点击输入正文':''" @blur="updateEditorBlock(section,block,$event)" v-text="block.text"></div></div></template></section></div><label class="word-page-footer"><span>页脚</span><input v-model="finalDocument.footer" placeholder="点击输入页脚" aria-label="编辑页脚"/><span class="page-number-setting"><span>页码格式</span><input v-model="finalDocument.page_number_format" placeholder="第 {page} 页" aria-label="编辑页码格式"/></span></label></article><div class="editor-footnote">原始表格按标书中的表格结构、合并单元格与 Word 样式导出；页码格式中使用 <code>{page}</code> 表示页码。</div></div></main></div>
       </section>
       <section v-else class="content detail-content">
         <div class="detail-heading"><div><div class="eyebrow">合同编号 / {{selected.contract_number || String(selected.id).padStart(4,'0')}}</div><h1>{{selected.title}}</h1><p>{{selected.requirements}}</p></div><div class="heading-actions"><span class="status-pill large" :class="statusTone(selected.status)"><i></i>{{stateLabel[selected.status]||selected.status}}</span><details class="action-dropdown" @mouseleave="$event.currentTarget.open=false"><summary>项目操作 <ChevronRight :size="14"/></summary><div class="action-dropdown-panel"><button class="danger-action" @click="deleteProject();closeActionMenu($event)"><Trash2 :size="15"/>删除项目</button></div></details><details class="action-dropdown" @mouseleave="$event.currentTarget.open=false"><summary>流程操作 <ChevronRight :size="14"/></summary><div class="action-dropdown-panel"><button v-if="busy" :disabled="stopLoading" @click="stopWorkflow();closeActionMenu($event)"><Square :size="15"/>停止流程</button><button v-if="canContinue" :disabled="continueLoading" @click="continueWorkflow();closeActionMenu($event)"><Play :size="15"/>继续生成</button><button :disabled="restartLoading" @click="restartAll();closeActionMenu($event)"><RefreshCw :size="15"/>重新开始</button><button :disabled="mergeLoading||!selected.chapters.length" @click="mergeNow();closeActionMenu($event)"><FileText :size="15"/>生成最终文本</button><button v-if="selected.status==='completed'" @click="showVersions();closeActionMenu($event)"><History :size="15"/>历史版本</button></div></details></div></div>
@@ -399,7 +425,7 @@ onMounted(()=>{ if(token.value) loadContracts() }); onUnmounted(()=>clearInterva
         <p v-if="!tablePreview.layout.tables.length" class="prompt-help">没有可预览的表格。</p>
         <div v-if="tablePreview.layout.tables.length" class="tender-preview-tables">
           <section v-for="(table,index) in tablePreview.layout.tables" :key="index" class="tender-preview-table">
-            <h4>表格 {{index+1}}</h4>
+            <h4>{{table.caption||('表格 '+(index+1))}}</h4>
             <TenderTable :table="table" fill-gaps/>
           </section>
         </div>

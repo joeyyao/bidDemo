@@ -41,6 +41,7 @@ function cellStyle(cell, columnIndex) {
 </script>
 
 <template>
+  <h4 v-if="table.caption" class="word-table-caption">{{ table.caption }}</h4>
   <div class="word-edit-table-wrap">
     <table class="word-edit-table" :style="tableStyle">
       <colgroup v-if="columnWidths.length">

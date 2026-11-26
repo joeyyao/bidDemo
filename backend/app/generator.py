@@ -47,6 +47,58 @@ PLANNER_PROMPT = long_prompt("""你是合同项目的 LangGraph 需求规划节�
 
 PLANNER_NO_REFERENCE_PROMPT = long_prompt("""你是合同项目的 LangGraph 需求规划节点。本项目没有上传参考文档，这是正常输入；不要等待参考文档，不要尝试匹配或推测参考合同结构和文风。只依据用户补充要求和标书压缩文本，先整体理解项目背景、采购目标、标的范围、技术与商务要求、主体职责、实施计划、交付成果、验收标准、价款支付、期限、服务保障、违约责任及其他明确约束，再按标书实际要求拆分合同阶段。不得把标书中未出现的内容写成既定事实；必要但缺失的信息标记为【待补充】。第一个阶段必须是“封面”，包含合同名称和编号。每个阶段应覆盖标书中对应的要求，避免遗漏、重复和凭空增加章节；给出标题、简洁描述、知识点、可执行的生成计划、逐项自查标准、至少500字的详细默认提示词，以及可从标书原文核实的 source_text。由于没有参考文档，每个阶段的 reference_text 必须是空字符串，且各阶段提示词不得要求依赖参考文档。标书没有上传时，改以用户补充要求为拆分依据。最终只输出合法 JSON 数组，每项字段为 title、description、knowledge_points、plan、check_criteria、prompt、source_text、reference_text；不要输出 Markdown 围栏或数组外文字。""")
 
+OPENING_OVERVIEW_TITLE = "开标一览表"
+OPENING_OVERVIEW_PROMPT = long_prompt("""本阶段是标书原表展示节点。只把标书中“开标一览表”的原表格按原有行列直接展示，不改写、不总结、不补充、不推测单元格内容；表格结构和单元格文字必须原样保留。若源表内容不可用，明确写【需补传原标书】。""")
+
+def opening_overview_excerpt(tender_text: str) -> str:
+    lines = (tender_text or "").splitlines()
+    starts = [index for index, line in enumerate(lines)
+              if re.fullmatch(r"\[\[TABLE_\d+_START\]\]", line.strip())]
+    for start in starts:
+        table_id = re.search(r"TABLE_(\d+)_START", lines[start]).group(1)
+        end = next((index for index in range(start + 1, len(lines))
+                    if re.fullmatch(rf"\[\[TABLE_{table_id}_END\]\]", lines[index].strip())), None)
+        if end is None:
+            continue
+        context = "\n".join(lines[max(0, start - 4):end + 1])
+        if OPENING_OVERVIEW_TITLE in context:
+            return f"【{OPENING_OVERVIEW_TITLE}（必须按标书原表展示）】\n" + "\n".join(lines[start:end + 1])
+    title_positions = [index for index, line in enumerate(lines) if OPENING_OVERVIEW_TITLE in line]
+    if title_positions:
+        groups = []
+        current = []
+        for line in lines:
+            if "|" in line:
+                current.append(line)
+            elif current:
+                groups.append(current)
+                current = []
+        if current:
+            groups.append(current)
+        if groups:
+            title = min(title_positions, key=lambda index: min(abs(index - lines.index(row)) for group in groups for row in group))
+            group = min(groups, key=lambda rows: min(abs(title - lines.index(row)) for row in rows))
+            table_id = 0
+            table_rows = []
+            for row_index, line in enumerate(group, start=1):
+                cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+                table_rows.append(f"表格 {table_id} 第 {row_index} 行：" + " | ".join(cells))
+            return (f"【{OPENING_OVERVIEW_TITLE}（必须按标书原表展示）】\n[[TABLE_{table_id}_START]]\n"
+                    + "\n".join(table_rows) + f"\n[[TABLE_{table_id}_END]]")
+    return ""
+
+def opening_overview_plan(tender_text: str, chapter_model: str = DEFAULT_MODEL) -> dict | None:
+    excerpt = opening_overview_excerpt(tender_text)
+    if not excerpt:
+        return None
+    return {"title": OPENING_OVERVIEW_TITLE,
+            "description": "单独展示标书中的开标一览表原表。",
+            "knowledge_points": "开标一览表原始行列与单元格内容",
+            "plan": "直接展示标书中的开标一览表，不改写或省略表格内容。",
+            "check_criteria": "必须包含标书开标一览表的原始表格及全部单元格内容，不得改写、总结或省略。",
+            "prompt": OPENING_OVERVIEW_PROMPT,
+            "source_text": excerpt, "reference_text": "", "model": chapter_model}
+
 CHAPTER_SYSTEM_PROMPT = long_prompt("""你是合同章节生成节点，必须使用所选百炼模型根据用户提示词和 LangGraph 规划结果起草当前章节。先核对用户要求、章节计划、知识点和检查标准之间的关系；只写当前节点负责的内容，不能替其他章节擅自作出未授权安排。条款应具体写明主体、行为、时点、条件、协作、交付或验收方式及违约后果中适用的要素。对缺失事实采用【待补充】标识，并用自然、严谨、可签署的中文组织标题和编号。明确区分义务、权利、条件、例外和程序，尽量避免“及时”“尽快”“相关”等无法执行的表达；如确需使用，应说明期限或确认办法。保持金额、日期、术语和主体称谓一致，不得凭空引用法规条文、外部模板或用户未提供的商业承诺。不得输出分析过程，只输出可供合同合并节点使用的章节正文。""")
 
 REVIEW_SYSTEM_PROMPT = long_prompt("""你是合同章节自查节点。请按照给定检查标准逐项核对本节点文本，并结合原始需求、章节知识点和计划，检查遗漏、歧义、前后不一致、无依据事实、主体错配、期限金额缺失、责任失衡、无法操作的条件、错误引用和不合适的重复内容。对于每个发现，说明对应文本或缺项、可能影响以及具体修改建议；没有发现时也要明确说明检查覆盖范围。不能把自查描述成法律意见或签署保证，不能重写其他章节。优先指出会妨碍履行或造成重大争议的事项，再列普通完善建议；所有未知信息仍应保留【待补充】提示。最终输出简明但充分的自查结论和修改建议，不输出隐藏推理链或与本合同无关的说明。""")
@@ -242,12 +294,22 @@ def compact_document_text(document: str, limit: int = 30000) -> str:
         return ""
     lines = []
     seen = set()
+    table_stack = []
     for raw_line in document.replace("\r", "\n").splitlines():
         line = re.sub(r"\s+", " ", raw_line).strip()
-        if not line or line in seen:
+        if not line:
             continue
-        seen.add(line)
+        marker = re.fullmatch(r"\[\[TABLE_(\d+)_(START|END)\]\]", line)
+        inside_table = bool(table_stack) or bool(marker and marker[2] == "START")
+        if not inside_table and line in seen:
+            continue
+        if not inside_table:
+            seen.add(line)
         lines.append(line)
+        if marker and marker[2] == "START":
+            table_stack.append(marker[1])
+        elif marker and marker[2] == "END" and marker[1] in table_stack:
+            table_stack = table_stack[:len(table_stack) - 1 - table_stack[::-1].index(marker[1])]
     normalized = "\n".join(lines)
     if len(normalized) <= limit:
         return normalized
@@ -255,14 +317,15 @@ def compact_document_text(document: str, limit: int = 30000) -> str:
     # Tables are source material, so retain every marked table block even when
     # that makes the planning view longer than its nominal text budget.
     table_indices = set()
-    inside_table = False
+    table_stack = []
     for index, line in enumerate(lines):
-        if re.fullmatch(r"\[\[TABLE_\d+_START\]\]", line):
-            inside_table = True
-        if inside_table:
+        marker = re.fullmatch(r"\[\[TABLE_(\d+)_(START|END)\]\]", line)
+        if marker and marker[2] == "START":
+            table_stack.append(marker[1])
+        if table_stack:
             table_indices.add(index)
-        if re.fullmatch(r"\[\[TABLE_\d+_END\]\]", line):
-            inside_table = False
+        if marker and marker[2] == "END" and marker[1] in table_stack:
+            table_stack = table_stack[:len(table_stack) - 1 - table_stack[::-1].index(marker[1])]
 
     important = re.compile(r"招标|投标|标书|采购|项目|合同|需求|范围|服务|技术|商务|交付|验收|质量|标准|期限|工期|进度|价款|报价|付款|支付|违约|责任|保密|知识产权|资质|资格|评分|响应|义务|权利|结算|保证|履约|风险|security|scope|delivery|acceptance|payment|requirement|qualification|technical|commercial", re.I)
     heading = re.compile(r"^(第[一二三四五六七八九十百0-9]+[章节条部分]|[一二三四五六七八九十]+[、.．]|\d+(?:\.\d+){0,3}[、.． ]|【[^】]{1,60}】)")
@@ -377,6 +440,14 @@ def parse_plans(raw: str, requirements: str, chapter_model: str = DEFAULT_MODEL,
                       "source_text": cover.get("source_text") or default_cover["source_text"],
                       "reference_text": cover.get("reference_text") or default_cover["reference_text"]})
         normalized.insert(0, cover)
+    overview = opening_overview_plan(tender_text, chapter_model)
+    if overview:
+        existing_overview_index = next((index for index, item in enumerate(normalized)
+                                        if item["title"].strip() == OPENING_OVERVIEW_TITLE), None)
+        if existing_overview_index is None:
+            normalized.insert(1, overview)
+        else:
+            normalized[existing_overview_index] = overview
     return normalized[:12]
 
 class State(TypedDict, total=False):
@@ -436,6 +507,11 @@ def start_route(state: State):
 def generate_node(state: State):
     chapter = state["chapter"]
     model = chapter.get("model", DEFAULT_MODEL)
+    if chapter.get("title") == OPENING_OVERVIEW_TITLE:
+        content = opening_overview_excerpt(chapter.get("source_text", "")) or chapter.get("source_text", "")
+        return {"generated": [{"title": chapter["title"], "content": content,
+                                "self_check": "已按标书原文直接保留开标一览表；未改写单元格内容。",
+                                "model": model}]}
     chapter_input = (f"合同名称：{state.get('contract_title', '合同')}\n合同编号：{state.get('contract_number', '【待补充】')}\n"
                      f"合同核心要求：\n{state.get('requirements', '')}\n\n阶段描述：\n{chapter.get('description', '')}\n\n"
                      f"对应标书文本：\n{chapter.get('source_text', '') or '无单独匹配摘录'}\n\n"

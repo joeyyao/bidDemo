@@ -1,4 +1,6 @@
-export const previewHeading = /^(第[一二三四五六七八九十百0-9]+[章节条]|[一二三四五六七八九十]+[、.]|\d+(?:\.\d+){0,3}[、.． ]|（[一二三四五六七八九十]+）)/
+export const previewHeading = /^(第(?:[一二三四五六七八九十百0-9]+|X(?:\+\d+)?)[章节条]|[一二三四五六七八九十]+[、.]|\d+(?:\.\d+){0,3}[、.． ]|（[一二三四五六七八九十]+）)/
+const levelOneHeading = /^(?:\d+[、.．](?!\d)\s*\S|第(?:[一二三四五六七八九十百0-9]+|X(?:\+\d+)?)[章节条]\s*\S|[一二三四五六七八九十]+[、.]\s*\S)/
+const numberedSubitem = /^\d+(?:\.\d+)+(?:[、.．]|\s|$)/
 
 function markdownCells(line = '') {
   const trimmed = line.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, '')
@@ -17,8 +19,24 @@ export function contentBlocks(value) {
 
   function flushText() {
     for (const paragraph of text.join('\n').split(/\n\s*\n/)) {
-      const trimmed = paragraph.trim()
-      if (trimmed) blocks.push({ kind: previewHeading.test(trimmed) ? 'heading' : 'paragraph', text: trimmed })
+      const lines = paragraph.split('\n').map(line => line.trim()).filter(Boolean)
+      let body = []
+      const flushBody = () => {
+        if (body.length) blocks.push({ kind: 'paragraph', text: body.join('\n') })
+        body = []
+      }
+      for (const line of lines) {
+        if (levelOneHeading.test(line)) {
+          flushBody()
+          blocks.push({ kind: 'heading', text: line })
+        } else if (numberedSubitem.test(line)) {
+          flushBody()
+          body.push(line)
+        } else {
+          body.push(line)
+        }
+      }
+      flushBody()
     }
     text = []
   }
@@ -52,5 +70,15 @@ export function restoreDraftTables(blocks) {
     if (block.kind !== 'paragraph' && block.kind !== 'heading') return [block]
     const parsed = contentBlocks(block.text)
     return parsed.some(item => item.kind === 'table') ? parsed : [block]
+  })
+}
+
+const numberedText = /^(?:\d+(?:\.\d+)*[、.．)]?|第(?:[一二三四五六七八九十百0-9]+|X(?:\+\d+)?)[章节条]|[一二三四五六七八九十]+[、.])/
+
+export function normalizeNumberedBlocks(blocks) {
+  return blocks.flatMap(block => {
+    if (!['paragraph', 'heading', 'subheading'].includes(block.kind)) return [block]
+    if (!numberedText.test((block.text || '').trim())) return restoreDraftTables([block])
+    return restoreDraftTables(contentBlocks(block.text))
   })
 }

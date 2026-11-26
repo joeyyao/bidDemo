@@ -24,7 +24,8 @@ from .database import Base, engine, get_db, SessionLocal
 from .models import User, Contract, Chapter, Version, WorkflowEvent
 from .schemas import Credentials, TokenOut, PromptUpdate, ModelUpdate, StageModelUpdate, ChapterCreate, ChapterTitleUpdate, ChapterOrderUpdate, ModelName, FinalDocumentUpdate
 from .auth import hash_password, verify_password, make_token, current_user
-from .generator import workflow, cover_plan, long_prompt, draft_stage, merge_node, normalize_model_text, compact_document_text
+from .generator import (workflow, cover_plan, long_prompt, draft_stage, merge_node, normalize_model_text,
+                        compact_document_text, opening_overview_plan, OPENING_OVERVIEW_TITLE)
 from .word_table_format import cell_format, table_format
 
 Path("data").mkdir(exist_ok=True)
@@ -212,19 +213,26 @@ def extract_docx_text(document_bytes: bytes) -> str:
     doc = Document(BytesIO(document_bytes))
     blocks = []
     table_index = 0
+    opening_overview_pending = False
     from docx.text.paragraph import Paragraph
     from docx.table import Table
     def extract_blocks(parent):
-        nonlocal table_index
+        nonlocal table_index, opening_overview_pending
         for element in parent.iterchildren():
             if element.tag == qn("w:p"):
                 paragraph_text = Paragraph(element, doc).text.strip()
                 if paragraph_text:
                     blocks.append(paragraph_text)
+                    if "开标一览表" in paragraph_text:
+                        opening_overview_pending = True
             elif element.tag == qn("w:tbl"):
                 this_table = table_index
                 table_index += 1
                 table = Table(element, doc)
+                table_text = " ".join(cell.text for row in table.rows for cell in row.cells)
+                is_opening_overview = opening_overview_pending or "开标一览表" in table_text
+                if is_opening_overview:
+                    blocks.append("【开标一览表（必须单独保留并按原表展示）】")
                 blocks.append(f"[[TABLE_{this_table}_START]]")
                 for row_index, row in enumerate(table.rows):
                     cells = [cell.text.strip().replace("\n", " / ") for cell in row.cells]
@@ -232,18 +240,24 @@ def extract_docx_text(document_bytes: bytes) -> str:
                     for cell in row.cells:
                         extract_blocks(cell._tc)
                 blocks.append(f"[[TABLE_{this_table}_END]]")
+                opening_overview_pending = False
+            else:
+                # DOCX content controls and other wrappers can contain real body paragraphs/tables.
+                extract_blocks(element)
     extract_blocks(doc.element.body)
     return "\n".join(blocks)
 
 def refresh_saved_tender_text(contract: Contract) -> bool:
-    if not (contract.tender_file_data and Path(contract.tender_filename).suffix.lower() == ".docx"):
+    payload = contract.tender_layout_data or contract.tender_file_data
+    filename = contract.tender_layout_filename or contract.tender_filename
+    if not (payload and Path(filename).suffix.lower() == ".docx"):
         return False
     if contract.id in _refreshed_tender_ids:
         return False
-    refreshed = contract.tender_text or extract_docx_text(contract.tender_file_data)
+    refreshed = contract.tender_text or extract_docx_text(payload)
     if (refreshed.count("_START]]") != refreshed.count("_END]]")
             or "[[TABLE_" not in refreshed):
-        refreshed = extract_docx_text(contract.tender_file_data)
+        refreshed = extract_docx_text(payload)
     compact = compact_document_text(refreshed, 30000)
     changed = refreshed != contract.tender_text or compact != contract.tender_compact_text
     contract.tender_text = refreshed
@@ -269,9 +283,39 @@ def body_tables(doc):
     return [table for table in doc.element.body.iter(qn("w:tbl"))
             if next(table.iterancestors(qn("w:tbl")), None) is None]
 
+def opening_overview_table_indices(doc):
+    from docx.text.paragraph import Paragraph
+    opening_overview_pending = False
+    indices = set()
+    table_index = 0
+    def walk(parent):
+        nonlocal table_index, opening_overview_pending
+        for element in parent.iterchildren():
+            if element.tag == qn("w:p"):
+                value = Paragraph(element, doc).text.strip()
+                if "开标一览表" in value:
+                    opening_overview_pending = True
+            elif element.tag == qn("w:tbl"):
+                if next(element.iterancestors(qn("w:tbl")), None) is not None:
+                    continue
+                table_text = " ".join(node.text or "" for node in element.iter(qn("w:t")))
+                if opening_overview_pending or "开标一览表" in table_text:
+                    indices.add(table_index)
+                table_index += 1
+                opening_overview_pending = False
+            else:
+                walk(element)
+    walk(doc.element.body)
+    return indices
+
 def extract_docx_table_layout(doc) -> list[dict]:
     styles = {style.get(qn("w:styleId")): style for style in doc.styles.element}
-    return [docx_table_layout(table, index, styles) for index, table in enumerate(body_tables(doc))]
+    overview_tables = opening_overview_table_indices(doc)
+    layouts = [docx_table_layout(table, index, styles) for index, table in enumerate(body_tables(doc))]
+    for index, layout in enumerate(layouts):
+        if index in overview_tables:
+            layout["caption"] = "开标一览表"
+    return layouts
 
 def docx_table_layout(table, table_index=0, styles=None):
     styles = styles or {}
@@ -334,7 +378,9 @@ def docx_table_layout(table, table_index=0, styles=None):
                 style[f"border-{edge}"] = value
         if style:
             cell["word_style"] = style
-    return {"table_index": table_index, "grid_columns": column_count, "column_widths": grid_widths,
+    table_text = " ".join(node.text or "" for node in table.iter(qn("w:t")))
+    return {"table_index": table_index, "caption": "开标一览表" if "开标一览表" in table_text else "",
+            "grid_columns": column_count, "column_widths": grid_widths,
             "word_width": width, "word_alignment": alignment, "rows": rows}
 
 _TABLE_SEPARATOR = re.compile(r"(?:^|(?<=\s))\|(?=\s|$)")
@@ -398,8 +444,19 @@ def tender_text_preview(value: str) -> list[dict]:
     return blocks
 
 def legacy_tender_tables(value: str) -> list[dict]:
-    tables = [block for block in tender_text_preview(value) if block["kind"] == "table"]
-    return [{"table_index": index, "rows": table["rows"]} for index, table in enumerate(tables)]
+    tables = []
+    opening_overview_pending = False
+    for block in tender_text_preview(value):
+        if block["kind"] == "text" and "开标一览表" in block["text"]:
+            opening_overview_pending = True
+        elif block["kind"] == "table":
+            table_text = " ".join(cell.get("text", "") for row in block["rows"] for cell in row)
+            if opening_overview_pending or "开标一览表" in table_text:
+                block["caption"] = "开标一览表"
+            tables.append(block)
+            opening_overview_pending = False
+    return [{"table_index": index, "caption": table.get("caption", ""), "rows": table["rows"]}
+            for index, table in enumerate(tables)]
 
 def docx_page_template(doc) -> dict:
     section = doc.sections[0]
@@ -471,6 +528,25 @@ def run_generation(contract_id: int, generation_id: str | None = None):
                 db.add(cover_chapter); db.commit(); chapters.insert(0, cover_chapter)
                 for index, chapter in enumerate(chapters, start=1): chapter.order = index
                 db.commit()
+            overview = opening_overview_plan(c.tender_text, node_models["chapter_default"])
+            if overview:
+                overview_chapter = next((chapter for chapter in chapters
+                                         if chapter.title.strip() == OPENING_OVERVIEW_TITLE), None)
+                if overview_chapter is None:
+                    overview_chapter = Chapter(contract_id=c.id, title=OPENING_OVERVIEW_TITLE)
+                    db.add(overview_chapter)
+                for field in ("description", "knowledge_points", "plan", "check_criteria", "prompt",
+                              "source_text", "reference_text", "model"):
+                    setattr(overview_chapter, field, overview[field])
+                cover_chapters = [chapter for chapter in chapters if "封面" in chapter.title]
+                other_chapters = [chapter for chapter in chapters
+                                  if chapter not in cover_chapters and chapter is not overview_chapter]
+                ordered_chapters = cover_chapters[:1] + [overview_chapter] + sorted(other_chapters, key=lambda chapter: chapter.order)
+                for index, chapter in enumerate(ordered_chapters):
+                    chapter.order = index
+                db.commit()
+                chapters = db.scalars(select(Chapter).where(
+                    Chapter.contract_id == c.id, Chapter.deleted_at.is_(None)).order_by(Chapter.order)).all()
             plans = [{"title": chapter.title, "description": chapter.description, "knowledge_points": chapter.knowledge_points, "plan": normalize_model_text(chapter.plan),
                       "check_criteria": chapter.check_criteria, "prompt": chapter.prompt, "model": chapter.model,
                       "source_text": chapter.source_text, "reference_text": chapter.reference_text} for chapter in chapters]
@@ -680,8 +756,11 @@ async def restore_tender_source(contract_id: int, tender_file: UploadFile = File
         raise HTTPException(422, "无法读取这个 DOCX 文件，请选择有效的原始标书。") from exc
     c.tender_layout_filename = filename
     c.tender_layout_data = payload
+    c.tender_text = extract_docx_text(payload)
+    c.tender_compact_text = compact_document_text(c.tender_text, 30000)
+    _refreshed_tender_ids.add(c.id)
     db.commit()
-    return layout
+    return {**layout, "tender_compact_text": c.tender_compact_text}
 
 def tender_docx_source(contract: Contract):
     if contract.tender_layout_filename and contract.tender_layout_data:
@@ -1155,7 +1234,34 @@ def export_draft_table(doc, block):
             paragraph = cell.paragraphs[0]
             if column < len(column_alignments):
                 paragraph.alignment = alignments.get(column_alignments[column])
-            paragraph.add_run(cell_data.get("text", "")).bold = bool(is_header)
+            run = paragraph.add_run(cell_data.get("text", ""))
+            set_run_format(run, size=9, bold=is_header)
+
+def apply_source_table_block(table_xml, block):
+    cell_updates = {cell["source_cell_index"]: cell for row in block.get("rows", []) for cell in row
+                    if cell.get("source_cell_index") is not None and cell.get("display", True)}
+    table_cells = (cell for row in table_xml.tr_lst for cell in row.tc_lst)
+    for index, table_cell in enumerate(table_cells):
+        value = cell_updates.get(index)
+        if value and value.get("text") != value.get("original_text") and value.get("original_text") == extract_docx_cell_text(table_cell):
+            replace_docx_cell_text(table_cell, value["text"])
+    set_docx_table_text_size(table_xml, 9)
+
+def set_docx_table_text_size(table_xml, size: float):
+    half_points = str(round(size * 2))
+    for run in table_xml.iter(qn("w:r")):
+        if not any(node.tag == qn("w:t") for node in run.iter()):
+            continue
+        properties = run.find(qn("w:rPr"))
+        if properties is None:
+            properties = OxmlElement("w:rPr")
+            run.insert(0, properties)
+        for tag in ("w:sz", "w:szCs"):
+            size_node = properties.find(qn(tag))
+            if size_node is None:
+                size_node = OxmlElement(tag)
+                properties.append(size_node)
+            size_node.set(qn("w:val"), half_points)
 
 def set_run_format(run, *, size=10, bold=None):
     run.font.name = "Microsoft YaHei"
@@ -1173,7 +1279,7 @@ def set_run_format(run, *, size=10, bold=None):
 
 def apply_final_document_format(doc):
     for name, size, bold in (("Normal", 10, False), ("Title", 18, True),
-                             ("Heading 1", 14, True), ("Heading 2", 10, False), ("Heading 3", 10, False)):
+                             ("Heading 1", 14, True), ("Heading 2", 10, True), ("Heading 3", 10, False)):
         style = doc.styles[name]
         style.font.name = "Microsoft YaHei"
         style.font.size = Pt(size)
@@ -1188,7 +1294,21 @@ def apply_final_document_format(doc):
             fonts.set(qn(f"w:{attribute}"), "Microsoft YaHei")
     for paragraph in doc.paragraphs:
         size = {"Title": 18, "Heading 1": 14, "Heading 2": 10, "Heading 3": 10}.get(paragraph.style.name, 10)
-        bold = paragraph.style.name in ("Title", "Heading 1")
+        bold = paragraph.style.name in ("Title", "Heading 1", "Heading 2")
+        paragraph_text = paragraph.text.lstrip()
+        parenthesized_item = bool(re.match(r"^[（(](?:\d+|[一二三四五六七八九十]+)[）)]", paragraph_text))
+        numbered_match = re.match(r"^(\d+(?:\.\d+)+)(?=[、.．\s]|$)", paragraph_text)
+        numbered_depth = len(numbered_match.group(1).split(".")) - 1 if numbered_match else 0
+        list_item = parenthesized_item or bool(re.match(r"^(?:\d+[、.．)]|[一二三四五六七八九十]+[、.．])", paragraph_text))
+        if parenthesized_item or numbered_depth:
+            paragraph.paragraph_format.left_indent = Pt(20 * (1 if parenthesized_item else numbered_depth))
+            paragraph.paragraph_format.first_line_indent = Pt(20)
+        elif paragraph.style.name in ("Normal", "Heading 2") or list_item:
+            paragraph.paragraph_format.left_indent = Pt(0)
+            paragraph.paragraph_format.first_line_indent = Pt(20)
+        if paragraph.style.name == "Heading 2":
+            paragraph.paragraph_format.space_before = Pt(12)
+            paragraph.paragraph_format.space_after = Pt(8)
         for run in paragraph.runs:
             set_run_format(run, size=size, bold=bold if bold else False)
     for table in doc.tables:
@@ -1196,13 +1316,13 @@ def apply_final_document_format(doc):
             for cell in row.cells:
                 for paragraph in cell.paragraphs:
                     for run in paragraph.runs:
-                        set_run_format(run, size=10, bold=True if row_index == 0 else None)
+                        set_run_format(run, size=9, bold=True if row_index == 0 else None)
                 for nested in cell.tables:
                     for nested_row in nested.rows:
                         for nested_cell in nested_row.cells:
                             for paragraph in nested_cell.paragraphs:
                                 for run in paragraph.runs:
-                                    set_run_format(run, size=10)
+                                    set_run_format(run, size=9)
     for part in (doc.sections[0].header, doc.sections[0].footer):
         for paragraph in part.paragraphs:
             for run in paragraph.runs:
@@ -1227,6 +1347,7 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
         except Exception as exc:
             raise HTTPException(422, "无法读取已保存的 DOCX，请补传有效的原始标书。") from exc
         source_tables = body_tables(doc)
+        source_overview_indices = opening_overview_table_indices(doc)
         source_page = docx_page_template(doc)
         body = doc._element.body
         for child in list(body):
@@ -1235,7 +1356,9 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
     else:
         doc = Document()
         source_tables = []
+        source_overview_indices = set()
         source_page = {}
+    used_source_tables = set()
     section = doc.sections[0]
     if not template_mode:
         section.top_margin = Inches(0.85); section.bottom_margin = Inches(0.85)
@@ -1274,6 +1397,7 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
         append_page_number(footer, page_format)
     if final_document and final_document.get("sections"):
         content_sections = [item for item in final_document["sections"] if not item.get("source_material")]
+        cover_paragraphs = []
         for section_index, item in enumerate(content_sections):
             if section_index:
                 doc.add_page_break()
@@ -1281,16 +1405,26 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
             title = str(item.get("title") or "未命名阶段")
             if is_cover:
                 cover_heading = doc.add_heading(cover_title or c.title, level=0)
-                cover_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                cover_heading.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                cover_paragraphs.append(cover_heading)
                 if contract_number:
                     number_paragraph = doc.add_paragraph(contract_number)
-                    number_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    number_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    cover_paragraphs.append(number_paragraph)
             else:
                 doc.add_heading(title, level=1)
             for block in item.get("blocks", []):
                 kind = block.get("kind")
                 if kind == "table":
-                    export_draft_table(doc, block)
+                    source_table_index = block.get("source_table_index")
+                    if source_table_index is not None and 0 <= int(source_table_index) < len(source_tables):
+                        source_table_index = int(source_table_index)
+                        table_xml = deepcopy(source_tables[source_table_index])
+                        apply_source_table_block(table_xml, block)
+                        doc._element.body.insert_element_before(table_xml, "w:sectPr")
+                        used_source_tables.add(source_table_index)
+                    else:
+                        export_draft_table(doc, block)
                     continue
                 text_value = str(block.get("text") or "")
                 if not text_value.strip(): continue
@@ -1301,14 +1435,17 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
                 else:
                     paragraph = doc.add_paragraph(text_value)
                 if is_cover:
-                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    cover_paragraphs.append(paragraph)
         if content_sections and not content_sections[0].get("is_cover"):
             doc.core_properties.title = c.title
     else:
         doc.add_heading(c.title, 0)
         for block in c.final_text.split("\n\n"):
             if block.strip(): doc.add_paragraph(block)
-    if source_tables:
+    remaining_source_tables = [(index, table) for index, table in enumerate(source_tables)
+                                if index not in used_source_tables]
+    if remaining_source_tables:
         doc.add_page_break()
         doc.add_heading("标书原始表格", level=1)
         draft = final_document or {}
@@ -1318,17 +1455,17 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
             for item in draft.get("sections", []):
                 if item.get("source_material"):
                     saved_tables.update({block.get("source_table_index"): block for block in item.get("blocks", []) if block.get("kind") == "table"})
-        for table_index, source_table in enumerate(source_tables):
+        for table_index, source_table in remaining_source_tables:
+            if table_index in source_overview_indices:
+                doc.add_heading("开标一览表", level=2)
             table_xml = deepcopy(source_table)
             saved = saved_tables.get(table_index, {})
-            cell_updates = {cell["source_cell_index"]: cell for row in saved.get("rows", []) for cell in row
-                            if cell.get("source_cell_index") is not None and cell.get("display", True)}
-            table_cells = (cell for row in table_xml.tr_lst for cell in row.tc_lst)
-            for index, table_cell in enumerate(table_cells):
-                value = cell_updates.get(index)
-                if value and value.get("text") != value.get("original_text") and value.get("original_text") == extract_docx_cell_text(table_cell):
-                    replace_docx_cell_text(table_cell, value["text"])
+            apply_source_table_block(table_xml, saved)
             body.insert_element_before(table_xml, "w:sectPr")
     apply_final_document_format(doc)
+    if final_document and final_document.get("sections"):
+        for paragraph in cover_paragraphs:
+            paragraph.paragraph_format.left_indent = Pt(0)
+            paragraph.paragraph_format.first_line_indent = Pt(0)
     buff = BytesIO(); doc.save(buff); buff.seek(0)
     return StreamingResponse(buff, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers={"Content-Disposition": f'attachment; filename="contract-{c.id}.docx"'})
