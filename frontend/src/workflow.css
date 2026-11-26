@@ -100,6 +100,7 @@
 .stage-model-choice{padding:7px 10px;border:1px solid #e8ecf1;border-radius:8px}
 @media(max-width:560px){.stage-toolbar{font-size:9px}.stage-source{margin-left:0}.stage-source pre{max-height:150px}.file-picker{font-size:9px}}
 .chapter-result{display:grid;gap:8px;border-top:1px solid #eff1f4;padding-top:10px}
+.stage-empty-placeholder{min-height:112px;margin-bottom:12px;padding:21px 20px;display:flex;align-items:center;gap:13px;border:1px dashed #d8e0eb;border-radius:11px;background:#fff}.stage-placeholder-icon{width:38px;height:38px;flex:none;border-radius:10px;display:grid;place-items:center;background:#f0f4fc;color:#6280bf}.stage-placeholder-copy{display:grid;gap:5px;min-width:0}.stage-placeholder-copy b{font-size:12px;color:#4d5c71}.stage-placeholder-copy span{font-size:10px;line-height:1.6;color:#929ca8}.stage-placeholder-count{margin-left:auto;white-space:nowrap;border-radius:6px;padding:6px 8px;background:#f1f3f7;color:#8b95a2;font-size:10px}
 .chapter-result .result-label{margin:0}
 .chapter-fold{overflow:hidden;border:1px solid #e9edf2;border-radius:8px;background:#fff}
 .preview-text-button{height:31px;border:1px solid #d5e0f7;border-radius:7px;background:#eef3ff;color:#355fc9;padding:0 11px;display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;white-space:nowrap;flex:none}
