@@ -209,15 +209,32 @@ def ask(system: str, user: str, model: str = DEFAULT_MODEL,
 def relevant_excerpt(document: str, title: str, knowledge_points: str, limit: int = 5000) -> str:
     if not document:
         return ""
-    paragraphs = [part.strip() for part in document.splitlines() if part.strip()]
+    paragraphs = []
+    source_label = ""
+    for part in document.splitlines():
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("【参考文档：") and part.endswith("】"):
+            source_label = part
+            continue
+        paragraphs.append((source_label, part))
     keywords = [term.strip() for term in (title + "、" + knowledge_points).replace("，", "、").replace(",", "、").split("、") if len(term.strip()) >= 2]
     ranked = sorted(((sum(paragraph.count(key) for key in keywords), index, paragraph)
-                     for index, paragraph in enumerate(paragraphs)), reverse=True)
+                     for index, (_, paragraph) in enumerate(paragraphs)), reverse=True)
     relevant = [item for item in ranked if item[0] > 0][:8]
     if not relevant:
         return ""
-    chosen = sorted((index, paragraph) for _, index, paragraph in relevant)
-    return "\n".join(paragraph for _, paragraph in chosen)[:limit]
+    chosen = sorted(index for _, index, _ in relevant)
+    excerpts = []
+    previous_label = None
+    for index in chosen:
+        label, paragraph = paragraphs[index]
+        if label and label != previous_label:
+            excerpts.append(label)
+        excerpts.append(paragraph)
+        previous_label = label
+    return "\n".join(excerpts)[:limit]
 
 def compact_document_text(document: str, limit: int = 30000) -> str:
     """Build and persist an extractive, one-pass planning view while retaining raw source text."""
@@ -235,6 +252,18 @@ def compact_document_text(document: str, limit: int = 30000) -> str:
     if len(normalized) <= limit:
         return normalized
 
+    # Tables are source material, so retain every marked table block even when
+    # that makes the planning view longer than its nominal text budget.
+    table_indices = set()
+    inside_table = False
+    for index, line in enumerate(lines):
+        if re.fullmatch(r"\[\[TABLE_\d+_START\]\]", line):
+            inside_table = True
+        if inside_table:
+            table_indices.add(index)
+        if re.fullmatch(r"\[\[TABLE_\d+_END\]\]", line):
+            inside_table = False
+
     important = re.compile(r"招标|投标|标书|采购|项目|合同|需求|范围|服务|技术|商务|交付|验收|质量|标准|期限|工期|进度|价款|报价|付款|支付|违约|责任|保密|知识产权|资质|资格|评分|响应|义务|权利|结算|保证|履约|风险|security|scope|delivery|acceptance|payment|requirement|qualification|technical|commercial", re.I)
     heading = re.compile(r"^(第[一二三四五六七八九十百0-9]+[章节条部分]|[一二三四五六七八九十]+[、.．]|\d+(?:\.\d+){0,3}[、.． ]|【[^】]{1,60}】)")
     scored = []
@@ -246,7 +275,7 @@ def compact_document_text(document: str, limit: int = 30000) -> str:
             score -= 2
         scored.append((score, index, line))
     # Keep the document boundaries and prioritize clause headings and requirement-bearing lines.
-    chosen = {0, len(lines) - 1}
+    chosen = {0, len(lines) - 1, *table_indices}
     budget = max(0, limit - len(lines))
     used = sum(len(lines[i]) for i in chosen)
     for _, index, line in sorted(scored, key=lambda item: (-item[0], item[1])):
@@ -254,7 +283,7 @@ def compact_document_text(document: str, limit: int = 30000) -> str:
             continue
         chosen.add(index)
         used += len(line)
-    return "\n".join(lines[index] for index in sorted(chosen))[:limit]
+    return "\n".join(lines[index] for index in sorted(chosen))
 
 def verified_excerpt(candidate: str, document: str, title: str, knowledge_points: str) -> str:
     candidate = candidate.strip()

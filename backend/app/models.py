@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, DateTime, ForeignKey, Integer
+from sqlalchemy import String, Text, DateTime, ForeignKey, Integer, LargeBinary
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import Base
 
@@ -22,6 +22,9 @@ class Contract(Base):
     tender_filename: Mapped[str] = mapped_column(String(255), default="")
     tender_text: Mapped[str] = mapped_column(Text, default="")
     tender_compact_text: Mapped[str] = mapped_column(Text, default="")
+    tender_file_data: Mapped[bytes] = mapped_column(LargeBinary, default=b"")
+    tender_layout_filename: Mapped[str] = mapped_column(String(255), default="")
+    tender_layout_data: Mapped[bytes] = mapped_column(LargeBinary, default=b"", deferred=True)
     reference_filename: Mapped[str] = mapped_column(String(255), default="")
     reference_text: Mapped[str] = mapped_column(Text, default="")
     reference_compact_text: Mapped[str] = mapped_column(Text, default="")

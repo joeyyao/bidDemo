@@ -31,15 +31,29 @@ class StageModelUpdate(BaseModel):
     stage: Literal["planner", "chapter_default"]
     model: ModelName
 
+class FinalDocumentTableCell(BaseModel):
+    source_cell_index: int | None = Field(default=None, ge=0)
+    text: str = Field(default="", max_length=100000)
+    original_text: str = Field(default="", max_length=100000)
+    colspan: int = Field(default=1, ge=1)
+    rowspan: int = Field(default=1, ge=0)
+    display: bool = True
+    placeholder: bool = False
+
 class FinalDocumentBlock(BaseModel):
-    kind: Literal["heading", "subheading", "paragraph"] = "paragraph"
-    text: str = Field(max_length=100000)
+    kind: Literal["heading", "subheading", "paragraph", "table"] = "paragraph"
+    text: str = Field(default="", max_length=100000)
+    source_table_index: int | None = Field(default=None, ge=0)
+    rows: list[list[FinalDocumentTableCell]] = Field(default_factory=list)
+    header_row: bool = False
+    column_alignments: list[Literal["left", "center", "right"]] = Field(default_factory=list)
 
 class FinalDocumentSection(BaseModel):
     chapter_id: int | None = None
     title: str = Field(max_length=200)
     is_cover: bool = False
-    blocks: list[FinalDocumentBlock] = Field(default_factory=list, max_length=300)
+    source_material: bool = False
+    blocks: list[FinalDocumentBlock] = Field(default_factory=list)
 
 class FinalDocumentUpdate(BaseModel):
     header: str = Field(default="", max_length=500)
@@ -47,4 +61,8 @@ class FinalDocumentUpdate(BaseModel):
     page_number_format: str = Field(default="第 {page} 页", max_length=120)
     cover_title: str = Field(default="", max_length=200)
     contract_number: str = Field(default="", max_length=120)
-    sections: list[FinalDocumentSection] = Field(min_length=1, max_length=50)
+    template_header: str = Field(default="", max_length=500)
+    template_footer: str = Field(default="", max_length=500)
+    template_page_number_format: str = Field(default="", max_length=120)
+    tender_layout_revision: str = Field(default="", max_length=64)
+    sections: list[FinalDocumentSection] = Field(min_length=1, max_length=51)
