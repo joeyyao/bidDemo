@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from copy import deepcopy
 from hashlib import sha256
+import base64
 from urllib.parse import quote
 import json
 import re
@@ -30,6 +31,7 @@ from .generator import (workflow, cover_plan, long_prompt, draft_stage, merge_no
 from .word_table_format import cell_format, table_format
 
 Path("data").mkdir(exist_ok=True)
+VML_IMAGE_DATA_TAG = "{urn:schemas-microsoft-com:vml}imagedata"
 Base.metadata.create_all(bind=engine)
 with engine.begin() as connection:
     contract_columns = {column["name"] for column in inspect(connection).get_columns("contracts")}
@@ -191,16 +193,22 @@ async def extract_document(upload: UploadFile | None, *, preserve_full_text: boo
     filename = Path(upload.filename).name
     payload = await upload.read()
     extension = Path(filename).suffix.lower()
+    has_raw_tail = False
     try:
         if extension in (".txt", ".md", ".text"):
             try: content = payload.decode("utf-8-sig")
             except UnicodeDecodeError: content = payload.decode("gb18030")
         elif extension == ".docx":
-            content = extract_docx_text(payload)
+            doc = Document(BytesIO(payload))
+            split_index = docx_preserved_page_start(doc)
+            has_raw_tail = split_index is not None
+            content = extract_docx_text(payload, split_index)
         elif extension == ".pdf":
             from pypdf import PdfReader
             reader = PdfReader(BytesIO(payload))
-            content = "\n".join(page.extract_text() or "" for page in reader.pages)
+            pages = [page.extract_text() or "" for page in reader.pages]
+            appendix_start = pdf_attachment_page_start(pages)
+            content = "\n【分页符】\n".join(pages[:appendix_start] if appendix_start is not None else pages)
         else:
             raise HTTPException(415, f"暂不支持 {extension or '未知'} 格式，请上传 DOCX、PDF、TXT 或 MD 文件")
     except HTTPException:
@@ -208,11 +216,12 @@ async def extract_document(upload: UploadFile | None, *, preserve_full_text: boo
     except Exception as exc:
         raise HTTPException(400, f"无法解析文件 {filename}：{str(exc)[:240]}") from exc
     content = content.strip()
-    if not content:
+    if not content and not has_raw_tail:
         raise HTTPException(400, f"文件 {filename} 没有可提取的文本内容（扫描版 PDF 暂不支持 OCR）")
     return filename, content if extension == ".docx" or preserve_full_text else content[:120000], payload
 
-def extract_docx_text(document_bytes: bytes) -> str:
+def extract_docx_text(document_bytes: bytes, end_element_index: int | None = None,
+                      start_element_index: int = 0) -> str:
     doc = Document(BytesIO(document_bytes))
     blocks = []
     table_index = 0
@@ -259,7 +268,12 @@ def extract_docx_text(document_bytes: bytes) -> str:
             else:
                 # DOCX content controls and other wrappers can contain real body paragraphs/tables.
                 extract_blocks(element)
-    extract_blocks(doc.element.body)
+    elements = [element for element in doc.element.body if element.tag != qn("w:sectPr")]
+    if end_element_index is not None:
+        elements = elements[:end_element_index]
+    elements = elements[start_element_index:]
+    for element in elements:
+        extract_blocks(element)
     return "\n".join(blocks)
 
 def refresh_saved_tender_text(contract: Contract) -> bool:
@@ -269,12 +283,10 @@ def refresh_saved_tender_text(contract: Contract) -> bool:
         return False
     if contract.id in _refreshed_tender_ids:
         return False
-    refreshed = contract.tender_text or extract_docx_text(payload)
-    if (refreshed.count("_START]]") != refreshed.count("_END]]")
-            or "[[TABLE_" not in refreshed):
-        refreshed = extract_docx_text(payload)
+    doc = Document(BytesIO(payload))
+    refreshed = extract_docx_text(payload, docx_preserved_page_start(doc))
     compact = compact_document_text(refreshed, 30000)
-    full_html = contract.tender_html or build_tender_html(filename, payload, refreshed)
+    full_html = build_tender_html(filename, payload, refreshed)
     changed = (refreshed != contract.tender_text or compact != contract.tender_compact_text
                or full_html != contract.tender_html)
     contract.tender_text = refreshed
@@ -487,6 +499,12 @@ def docx_paragraph_html(element, doc) -> str:
             fragments.append("&#9;")
         elif node.tag in (qn("w:br"), qn("w:cr")):
             fragments.append("<br>")
+        elif node.tag in (qn("a:blip"), VML_IMAGE_DATA_TAG):
+            relationship_id = node.get(qn("r:embed")) or node.get(qn("r:id"))
+            image_part = doc.part.related_parts.get(relationship_id) if relationship_id else None
+            if image_part is not None:
+                image_data = base64.b64encode(image_part.blob).decode("ascii")
+                fragments.append(f'<img src="data:{image_part.content_type};base64,{image_data}" alt="标书原始图片">')
     content = "".join(fragments) or "&#160;"
     style_name = paragraph.style.name if paragraph.style else ""
     heading_match = re.match(r"(?:Heading|标题)\s*(\d+)", style_name, re.I)
@@ -526,10 +544,20 @@ def docx_blocks_html(parent, doc, elements=None) -> str:
         if element.tag == qn("w:p"):
             paragraph = Paragraph(element, doc)
             text_value = paragraph.text.strip()
-            if text_value:
+            has_text = any(node.tag == qn("w:t") and (node.text or "").strip()
+                            for node in element.iter())
+            has_image = any(node.tag in (qn("a:blip"), VML_IMAGE_DATA_TAG) for node in element.iter())
+            properties = element.find(qn("w:pPr"))
+            if properties is not None and properties.find(qn("w:pageBreakBefore")) is not None:
+                parts.append('<div class="tender-page-break"></div>')
+            if text_value or has_text or has_image:
                 parts.append(docx_paragraph_html(element, doc))
                 if "开标一览表" in text_value:
                     opening_overview_pending = True
+            if any(node.tag == qn("w:lastRenderedPageBreak") or
+                   (node.tag == qn("w:br") and node.get(qn("w:type")) == "page")
+                   for node in element.iter()):
+                parts.append('<div class="tender-page-break"></div>')
         elif element.tag == qn("w:tbl"):
             table_text = " ".join(node.text or "" for node in element.iter(qn("w:t")))
             caption = "开标一览表" if opening_overview_pending or "开标一览表" in table_text else ""
@@ -541,40 +569,151 @@ def docx_blocks_html(parent, doc, elements=None) -> str:
                 parts.append(nested)
     return "".join(parts)
 
-def docx_signature_tail(doc) -> dict | None:
+def docx_signature_page_start(doc) -> int | None:
     elements = [element for element in doc.element.body if element.tag != qn("w:sectPr")]
-    from docx.text.paragraph import Paragraph
     texts = []
     for element in elements:
         if element.tag == qn("w:p"):
-            texts.append(Paragraph(element, doc).text.strip())
+            texts.append(" ".join(node.text or "" for node in element.iter(qn("w:t"))).strip())
         else:
             texts.append(" ".join(node.text or "" for node in element.iter(qn("w:t"))).strip())
     anchor = None
-    for index in range(len(texts)):
+    for index, value in enumerate(texts):
         context = "\n".join(texts[max(0, index - 12):min(len(texts), index + 13)])
-        if (re.search(r"甲方|采购人|买方", context) and
-                re.search(r"乙方|供应商|卖方", context) and
-                re.search(r"签字|签章|盖章|签署", texts[index])):
+        if (re.search(r"甲方|甲乙双方|采购人|买方", context) and
+                re.search(r"乙方|甲乙双方|供应商|卖方", context) and
+                re.search(r"签字|签章|盖章|签署|签约|签订", value)):
             anchor = index
     if anchor is None:
         return None
-    start = anchor + 1
-    for index in range(start, len(elements)):
+
+    # Rewind to the first body element after the preceding explicit page break.
+    # If the DOCX has no stored pagination marker, keep the full signature element.
+    start = anchor
+    for index in range(anchor):
         element = elements[index]
         properties = element.find(qn("w:pPr")) if element.tag == qn("w:p") else None
         if properties is not None and properties.find(qn("w:pageBreakBefore")) is not None:
             start = index
-            break
         section_break = properties.find(qn("w:sectPr")) if properties is not None else None
         section_type = section_break.find(qn("w:type")) if section_break is not None else None
         has_section_page_break = section_break is not None and (section_type is None or
                                 section_type.get(qn("w:val")) in ("nextPage", "oddPage", "evenPage"))
-        if has_section_page_break or any(node.tag == qn("w:lastRenderedPageBreak") or
-               (node.tag == qn("w:br") and node.get(qn("w:type")) == "page")
-               for node in element.iter()):
+        has_page_break = any(node.tag == qn("w:lastRenderedPageBreak") or
+                             (node.tag == qn("w:br") and node.get(qn("w:type")) == "page")
+                             for node in element.iter())
+        if has_section_page_break or has_page_break:
             start = index + 1
-            break
+    anchor_properties = elements[anchor].find(qn("w:pPr")) if elements[anchor].tag == qn("w:p") else None
+    if anchor_properties is not None and anchor_properties.find(qn("w:pageBreakBefore")) is not None:
+        start = anchor
+    return min(start, anchor)
+
+ATTACHMENT_HEADING = re.compile(
+    r"^(?:附件|附录)(?:材料|清单|证明|文件|表格|目录)?(?:\s*(?:[一二三四五六七八九十百零〇0-9]+|[A-Za-z]))?"
+    r"(?:\s*[：:、.．-]\s*[^。；;]{1,70}|\s+[^。；;]{1,70})?$"
+)
+
+def is_attachment_heading(value: str) -> bool:
+    text_value = re.sub(r"\s+", " ", (value or "").strip())
+    return bool(text_value and len(text_value) <= 90 and ATTACHMENT_HEADING.fullmatch(text_value))
+
+def element_has_page_break(element) -> bool:
+    properties = element.find(qn("w:pPr")) if element.tag == qn("w:p") else None
+    section_break = properties.find(qn("w:sectPr")) if properties is not None else None
+    section_type = section_break.find(qn("w:type")) if section_break is not None else None
+    has_section_break = section_break is not None and (section_type is None or
+                         section_type.get(qn("w:val")) in ("nextPage", "oddPage", "evenPage"))
+    return has_section_break or any(node.tag == qn("w:lastRenderedPageBreak") or
+                                    (node.tag == qn("w:br") and node.get(qn("w:type")) == "page")
+                                    for node in element.iter())
+
+def docx_attachment_page_start(doc) -> int | None:
+    """Find an appendix heading, rewinding to its page boundary when Word stored one."""
+    from docx.text.paragraph import Paragraph
+    elements = [element for element in doc.element.body if element.tag != qn("w:sectPr")]
+    current_page_start = 0
+    boundary_seen = False
+    page_content_seen = False
+    for index, element in enumerate(elements):
+        properties = element.find(qn("w:pPr")) if element.tag == qn("w:p") else None
+        if properties is not None and properties.find(qn("w:pageBreakBefore")) is not None:
+            current_page_start = index
+            boundary_seen = True
+            page_content_seen = False
+        if element.tag == qn("w:p") and is_attachment_heading(Paragraph(element, doc).text):
+            return current_page_start if boundary_seen and not page_content_seen else index
+        if any((node.text or "").strip() for node in element.iter(qn("w:t"))):
+            page_content_seen = True
+        if element_has_page_break(element):
+            current_page_start = index + 1
+            boundary_seen = True
+            page_content_seen = False
+    return None
+
+def docx_preserved_page_start(doc) -> int | None:
+    starts = [value for value in (docx_attachment_page_start(doc), docx_signature_page_start(doc))
+              if value is not None]
+    return min(starts) if starts else None
+
+def pdf_attachment_page_start(pages: list[str]) -> int | None:
+    for index, page in enumerate(pages):
+        lines = [line.strip() for line in (page or "").splitlines() if line.strip()]
+        if any(is_attachment_heading(line) for line in lines[:8]):
+            return index
+        if index > 0 and re.search(r"(?m)^\s*(?:附件|附录)(?:\s*[一二三四五六七八九十百零〇0-9A-Za-z]+)?\s*[：:、.]?\s*$", page[:800]):
+            return index
+    return None
+
+def docx_preserved_tail(doc) -> dict | None:
+    elements = [element for element in doc.element.body if element.tag != qn("w:sectPr")]
+    start = docx_preserved_page_start(doc)
+    if start is None or start >= len(elements):
+        return None
+    from docx.text.paragraph import Paragraph
+    tail_elements = elements[start:]
+    tail_text = []
+    pages = []
+    page_buffer = []
+    for element in tail_elements:
+        properties = element.find(qn("w:pPr")) if element.tag == qn("w:p") else None
+        starts_page = properties is not None and properties.find(qn("w:pageBreakBefore")) is not None
+        if starts_page and page_buffer:
+            pages.append("\n".join(page_buffer).strip())
+            page_buffer = []
+        if element.tag == qn("w:p"):
+            value = Paragraph(element, doc).text.strip()
+            if value:
+                tail_text.append(value)
+                page_buffer.append(value)
+        elif element.tag == qn("w:tbl"):
+            for row in element.findall(qn("w:tr")):
+                value = " | ".join(" ".join(node.text or "" for node in cell.iter(qn("w:t"))).strip()
+                                   for cell in row.findall(qn("w:tc")))
+                tail_text.append(value)
+                page_buffer.append(value)
+        if element_has_page_break(element) and page_buffer:
+            pages.append("\n".join(page_buffer).strip())
+            page_buffer = []
+    if page_buffer:
+        pages.append("\n".join(page_buffer).strip())
+    plain_text = "\n".join(tail_text).strip()
+    table_indices = {table: index for index, table in enumerate(body_tables(doc))}
+    source_table_indices = sorted({table_indices[table] for element in tail_elements
+                                   for table in element.iter(qn("w:tbl")) if table in table_indices})
+    kind = "attachment" if docx_attachment_page_start(doc) is not None else "signature"
+    return {"kind": kind, "start_element_index": start,
+            "html": f'<div class="tender-html-document">{tender_html_styles()}'
+                     f'{docx_blocks_html(doc.element.body, doc, tail_elements)}</div>',
+            "text": plain_text, "pages": pages, "source_element_indices": list(range(start, len(elements))),
+            "source_table_indices": source_table_indices}
+
+def docx_signature_tail(doc) -> dict | None:
+    elements = [element for element in doc.element.body if element.tag != qn("w:sectPr")]
+    start = docx_signature_page_start(doc)
+    if start is None or start >= len(elements):
+        return None
+    from docx.text.paragraph import Paragraph
     tail_elements = elements[start:]
     tail_text = []
     for element in tail_elements:
@@ -587,13 +726,20 @@ def docx_signature_tail(doc) -> dict | None:
                 tail_text.append(" | ".join(" ".join(node.text or "" for node in cell.iter(qn("w:t"))).strip()
                                             for cell in row.findall(qn("w:tc"))))
     plain_text = "\n".join(tail_text).strip()
-    if not plain_text:
-        return None
     table_indices = {table: index for index, table in enumerate(body_tables(doc))}
     source_table_indices = sorted({table_indices[table] for element in tail_elements
                                    for table in element.iter(qn("w:tbl")) if table in table_indices})
-    return {"html": f'<div class="tender-html-document">{tender_html_styles()}'
-                     f'{docx_blocks_html(doc.element.body, doc, tail_elements)}</div>',
+    final_section = doc.sections[-1]
+    header_html = docx_blocks_html(final_section.header._element, doc)
+    footer_html = docx_blocks_html(final_section.footer._element, doc)
+    if final_section.different_first_page_header_footer:
+        header_html += docx_blocks_html(final_section.first_page_header._element, doc)
+        footer_html += docx_blocks_html(final_section.first_page_footer._element, doc)
+    return {"start_element_index": start,
+            "html": f'<div class="tender-html-document">{tender_html_styles()}'
+                     f'<div class="tender-original-header">{header_html}</div>'
+                     f'{docx_blocks_html(doc.element.body, doc, tail_elements)}'
+                     f'<div class="tender-original-footer">{footer_html}</div></div>',
             "text": plain_text, "source_element_indices": list(range(start, len(elements))),
             "source_table_indices": source_table_indices}
 
@@ -603,12 +749,35 @@ def tender_html_styles() -> str:
             ".tender-html-document p{margin:.35em 0;white-space:pre-wrap}"
             ".tender-html-document table{width:100%;border-collapse:collapse;margin:10px 0;table-layout:auto}"
             ".tender-html-document caption{text-align:left;font-weight:700;padding:5px 0}"
-            ".tender-html-document td{border:1px solid #8993a0;padding:5px 7px;vertical-align:top;white-space:pre-wrap}</style>")
+            ".tender-html-document td{border:1px solid #8993a0;padding:5px 7px;vertical-align:top;white-space:pre-wrap}"
+            ".tender-html-document img{max-width:100%;height:auto}"
+            ".tender-page-break{height:24px;margin:18px 0;border-top:1px dashed #aab2bf}</style>")
 
-def extract_docx_html(document_bytes: bytes) -> str:
+def extract_docx_html(document_bytes: bytes, end_element_index: int | None = None) -> str:
     doc = Document(BytesIO(document_bytes))
-    body = docx_blocks_html(doc.element.body, doc)
+    elements = [element for element in doc.element.body if element.tag != qn("w:sectPr")]
+    if end_element_index is not None:
+        elements = elements[:end_element_index]
+    body = docx_blocks_html(doc.element.body, doc, elements)
     return f'<div class="tender-html-document">{tender_html_styles()}{body}</div>'
+
+def pdf_preserved_tail(filename: str, payload: bytes) -> dict | None:
+    try:
+        from pypdf import PdfReader
+        pages = [page.extract_text() or "" for page in PdfReader(BytesIO(payload)).pages]
+    except Exception:
+        return None
+    start = pdf_attachment_page_start(pages)
+    if start is None:
+        return None
+    tail_pages = [page.strip() for page in pages[start:] if page.strip()]
+    text_value = "\n\n".join(tail_pages)
+    rendered = "".join(f'<section class="tender-attachment-page"><h3>附件 第 {start + index + 1} 页</h3>'
+                       f'{text_document_html(page)}</section>'
+                       for index, page in enumerate(tail_pages))
+    return {"kind": "attachment", "text": text_value, "pages": tail_pages,
+            "html": f'<div class="tender-html-document">{tender_html_styles()}{rendered}</div>',
+            "start_page_number": start + 1}
 
 def text_document_html(value: str) -> str:
     blocks = tender_text_preview(value)
@@ -632,7 +801,8 @@ def text_document_html(value: str) -> str:
 def build_tender_html(filename: str, payload: bytes, text_value: str) -> str:
     if Path(filename).suffix.lower() == ".docx" and payload:
         try:
-            return extract_docx_html(payload)
+            doc = Document(BytesIO(payload))
+            return extract_docx_html(payload, docx_preserved_page_start(doc))
         except Exception:
             pass
     return text_document_html(text_value) if text_value else ""
@@ -932,9 +1102,10 @@ async def restore_tender_source(contract_id: int, tender_file: UploadFile = File
         raise HTTPException(422, "无法读取这个 DOCX 文件，请选择有效的原始标书。") from exc
     c.tender_layout_filename = filename
     c.tender_layout_data = payload
-    c.tender_text = extract_docx_text(payload)
+    doc = Document(BytesIO(payload))
+    c.tender_text = extract_docx_text(payload, docx_preserved_page_start(doc))
     c.tender_compact_text = compact_document_text(c.tender_text, 30000)
-    c.tender_html = extract_docx_html(payload)
+    c.tender_html = extract_docx_html(payload, docx_preserved_page_start(doc))
     _refreshed_tender_ids.add(c.id)
     db.commit()
     return {**layout, "tender_compact_text": c.tender_compact_text,
@@ -949,14 +1120,19 @@ def tender_docx_source(contract: Contract):
 
 def read_tender_layout(filename, payload):
     doc = Document(BytesIO(payload))
+    preserved_tail = docx_preserved_tail(doc)
     return {"supported": True, "filename": filename, "revision": sha256(payload).hexdigest(),
             **docx_page_template(doc), "tables": extract_docx_table_layout(doc),
-            "signature_tail": docx_signature_tail(doc)}
+            "signature_tail": docx_signature_tail(doc),
+            "preserved_tail": preserved_tail,
+            "attachment_tail": preserved_tail if docx_attachment_page_start(doc) is not None else None}
 
 @app.get("/api/contracts/{contract_id}/tender-layout")
 def get_tender_layout(contract_id: int, split_preview: bool = False, db: Session = Depends(get_db), user: User = Depends(current_user)):
     c = owned_contract(db, contract_id, user.id)
     filename, payload = tender_docx_source(c)
+    if not payload and Path(c.tender_filename or "").suffix.lower() == ".pdf":
+        filename, payload = c.tender_filename, c.tender_file_data
     preview = {}
     if split_preview:
         full_html = c.tender_html or build_tender_html(filename or c.tender_filename, payload or c.tender_file_data, c.tender_text)
@@ -971,10 +1147,15 @@ def get_tender_layout(contract_id: int, split_preview: bool = False, db: Session
         elif not c.tender_filename.lower().endswith(".docx"):
             reason = "当前标书格式无法恢复 Word 表格结构，可补传对应的原始 DOCX。"
         return {"supported": False, "reason": reason, "tables": tables, **preview}
+    if Path(filename).suffix.lower() == ".pdf":
+        preserved_tail = pdf_preserved_tail(filename, payload)
+        return {"supported": False, "filename": filename, "reason": "PDF 标书保留附件按原页提取文本展示；最终 Word 中会附加附件页文本。",
+                "tables": [], "preserved_tail": preserved_tail, "attachment_tail": preserved_tail, **preview}
     try:
         return {**read_tender_layout(filename, payload), **preview}
     except Exception as exc:
-        raise HTTPException(422, "无法读取已保存的 DOCX，请补传有效的原始标书。") from exc
+        detail = f"无法读取已保存的 DOCX（{type(exc).__name__}: {str(exc)[:160]}）。请重新上传有效的原始标书。"
+        raise HTTPException(422, detail) from exc
 
 @app.delete("/api/contracts/{contract_id}", status_code=202)
 def delete_contract(contract_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
@@ -1268,7 +1449,7 @@ def save_final_document(contract_id: int, data: FinalDocumentUpdate,
     c.page_number_format = data.page_number_format
     sections = []
     for section in data.sections:
-        if section.source_material:
+        if section.source_material or section.original_document:
             continue
         blocks = []
         for block in section.blocks:
@@ -1426,23 +1607,6 @@ def apply_source_table_block(table_xml, block):
         value = cell_updates.get(index)
         if value and value.get("text") != value.get("original_text") and value.get("original_text") == extract_docx_cell_text(table_cell):
             replace_docx_cell_text(table_cell, value["text"])
-    set_docx_table_text_size(table_xml, 9)
-
-def set_docx_table_text_size(table_xml, size: float):
-    half_points = str(round(size * 2))
-    for run in table_xml.iter(qn("w:r")):
-        if not any(node.tag == qn("w:t") for node in run.iter()):
-            continue
-        properties = run.find(qn("w:rPr"))
-        if properties is None:
-            properties = OxmlElement("w:rPr")
-            run.insert(0, properties)
-        for tag in ("w:sz", "w:szCs"):
-            size_node = properties.find(qn(tag))
-            if size_node is None:
-                size_node = OxmlElement(tag)
-                properties.append(size_node)
-            size_node.set(qn("w:val"), half_points)
 
 def fit_export_table(table_xml, available_twips: int):
     """Keep source table proportions while fitting it inside the printable page area."""
@@ -1507,19 +1671,22 @@ def fit_export_table(table_xml, available_twips: int):
         margin.set(qn("w:w"), str(max(current, 80)))
         margin.set(qn("w:type"), "dxa")
 
-def normalize_export_table_layout(doc):
+def normalize_export_table_layout(doc, preserved_tables=None, normalize_margins=True):
+    preserved_tables = set(preserved_tables or [])
     for section in doc.sections:
-        # Source templates sometimes use nearly zero margins, which leaves tables
-        # cramped against the page edge after the contract is inserted.
-        minimum_margin = Inches(0.75)
-        section.left_margin = max(section.left_margin or minimum_margin, minimum_margin)
-        section.right_margin = max(section.right_margin or minimum_margin, minimum_margin)
-        section.top_margin = max(section.top_margin or minimum_margin, minimum_margin)
-        section.bottom_margin = max(section.bottom_margin or minimum_margin, minimum_margin)
+        if normalize_margins:
+            # Source templates sometimes use nearly zero margins, which leaves tables
+            # cramped against the page edge after the contract is inserted.
+            minimum_margin = Inches(0.75)
+            section.left_margin = max(section.left_margin or minimum_margin, minimum_margin)
+            section.right_margin = max(section.right_margin or minimum_margin, minimum_margin)
+            section.top_margin = max(section.top_margin or minimum_margin, minimum_margin)
+            section.bottom_margin = max(section.bottom_margin or minimum_margin, minimum_margin)
         page_width = section.page_width or Inches(8.27)
         available_twips = max(1, round((page_width - section.left_margin - section.right_margin) / 635))
         for table in doc._element.body.iter(qn("w:tbl")):
-            fit_export_table(table, available_twips)
+            if table not in preserved_tables:
+                fit_export_table(table, available_twips)
 
 def set_run_format(run, *, size=10, bold=None):
     run.font.name = "Microsoft YaHei"
@@ -1617,8 +1784,8 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
         except Exception as exc:
             raise HTTPException(422, "无法读取已保存的 DOCX，请补传有效的原始标书。") from exc
         source_tables = body_tables(doc)
-        source_overview_indices = opening_overview_table_indices(doc)
         source_page = docx_page_template(doc)
+        signature_start_index = docx_signature_page_start(doc)
         body = doc._element.body
         source_body_elements = [child for child in body if child.tag != qn("w:sectPr")]
         for child in source_body_elements:
@@ -1626,12 +1793,12 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
     else:
         doc = Document()
         source_tables = []
-        source_overview_indices = set()
         source_page = {}
+        signature_start_index = None
         source_body_elements = []
-    used_source_tables = set()
     used_source_elements = set()
     preserved_source_elements = []
+    preserved_source_tables = set()
     section = doc.sections[0]
     if not template_mode:
         section.top_margin = Inches(0.85); section.bottom_margin = Inches(0.85)
@@ -1643,11 +1810,10 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
     template_footer = (final_document or {}).get("template_footer", "")
     template_page_format = (final_document or {}).get("template_page_number_format", "")
     footer = section.footer.paragraphs[0]
-    update_footer = not template_mode or (
-        template_footer == source_page.get("footer")
-        and template_page_format == source_page.get("page_number_format")
-        and (footer_text != template_footer or page_format != template_page_format)
-    )
+    update_footer = not template_mode or (signature_start_index is None and
+        template_footer == source_page.get("footer") and
+        template_page_format == source_page.get("page_number_format") and
+        (footer_text != template_footer or page_format != template_page_format))
     if update_footer:
         for child in list(footer._p):
             if child.tag != qn("w:pPr"):
@@ -1669,11 +1835,26 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
     if "{page}" in page_format and update_footer:
         append_page_number(footer, page_format)
     if final_document and final_document.get("sections"):
-        content_sections = [item for item in final_document["sections"] if not item.get("source_material")]
+        regular_sections = [item for item in final_document["sections"]
+                            if not item.get("source_material") and not item.get("original_document")]
+        raw_document_sections = [item for item in final_document["sections"] if item.get("original_document")]
+        content_sections = [*regular_sections, *raw_document_sections]
         cover_paragraphs = []
         for section_index, item in enumerate(content_sections):
+            source_only = bool(item.get("original_document")) or (bool(item.get("blocks")) and all(
+                block.get("kind") == "source_html" for block in item.get("blocks", [])))
             if section_index:
-                doc.add_page_break()
+                first_source_index = next((int(source_index)
+                    for block in item.get("blocks", []) if block.get("kind") == "source_html"
+                    for source_index in block.get("source_element_indices", [])), None)
+                first_source = (source_body_elements[first_source_index]
+                                if source_only and first_source_index is not None and
+                                0 <= first_source_index < len(source_body_elements) else None)
+                first_properties = first_source.find(qn("w:pPr")) if first_source is not None and first_source.tag == qn("w:p") else None
+                starts_with_page_break = (first_properties is not None and
+                    first_properties.find(qn("w:pageBreakBefore")) is not None)
+                if not (source_only and starts_with_page_break):
+                    doc.add_page_break()
             is_cover = bool(item.get("is_cover"))
             title = str(item.get("title") or "未命名阶段")
             if is_cover:
@@ -1684,7 +1865,7 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
                     number_paragraph = doc.add_paragraph(contract_number)
                     number_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
                     cover_paragraphs.append(number_paragraph)
-            else:
+            elif not source_only:
                 doc.add_heading(title, level=1)
             for block in item.get("blocks", []):
                 kind = block.get("kind")
@@ -1696,9 +1877,8 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
                                 copied_element = deepcopy(source_body_elements[element_index])
                                 body.insert_element_before(copied_element, "w:sectPr")
                                 preserved_source_elements.append(copied_element)
+                                preserved_source_tables.update(copied_element.iter(qn("w:tbl")))
                                 used_source_elements.add(element_index)
-                        used_source_tables.update(int(index) for index in block.get("source_table_indices", [])
-                                                  if 0 <= int(index) < len(source_tables))
                     else:
                         for line in str(block.get("text") or "").splitlines():
                             if line.strip():
@@ -1726,7 +1906,6 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
                         table_xml = deepcopy(source_tables[source_table_index])
                         apply_source_table_block(table_xml, block)
                         doc._element.body.insert_element_before(table_xml, "w:sectPr")
-                        used_source_tables.add(source_table_index)
                     else:
                         export_draft_table(doc, block)
                     continue
@@ -1747,26 +1926,18 @@ def export_contract(contract_id: int, db: Session = Depends(get_db), user: User 
         doc.add_heading(c.title, 0)
         for block in c.final_text.split("\n\n"):
             if block.strip(): doc.add_paragraph(block)
-    remaining_source_tables = [(index, table) for index, table in enumerate(source_tables)
-                                if index not in used_source_tables]
-    if remaining_source_tables:
-        doc.add_page_break()
-        doc.add_heading("标书原始表格", level=1)
-        draft = final_document or {}
-        saved_revision = draft.get("tender_layout_revision")
-        saved_tables = {}
-        if not saved_revision or saved_revision == sha256(source_payload).hexdigest():
-            for item in draft.get("sections", []):
-                if item.get("source_material"):
-                    saved_tables.update({block.get("source_table_index"): block for block in item.get("blocks", []) if block.get("kind") == "table"})
-        for table_index, source_table in remaining_source_tables:
-            if table_index in source_overview_indices:
-                doc.add_heading("开标一览表", level=2)
-            table_xml = deepcopy(source_table)
-            saved = saved_tables.get(table_index, {})
-            apply_source_table_block(table_xml, saved)
-            body.insert_element_before(table_xml, "w:sectPr")
-    normalize_export_table_layout(doc)
+    if template_mode:
+        signature_start = signature_start_index
+        if signature_start is not None:
+            saved_source_indices = set(used_source_elements)
+            for element_index in range(signature_start, len(source_body_elements)):
+                if element_index in saved_source_indices:
+                    continue
+                copied_element = deepcopy(source_body_elements[element_index])
+                body.insert_element_before(copied_element, "w:sectPr")
+                preserved_source_elements.append(copied_element)
+                preserved_source_tables.update(copied_element.iter(qn("w:tbl")))
+    normalize_export_table_layout(doc, preserved_source_tables, normalize_margins=not template_mode)
     apply_final_document_format(doc, preserved_source_elements)
     if final_document and final_document.get("sections"):
         for paragraph in cover_paragraphs:

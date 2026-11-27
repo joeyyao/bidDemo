@@ -58,6 +58,7 @@ class FinalDocumentSection(BaseModel):
     title: str = Field(max_length=200)
     is_cover: bool = False
     source_material: bool = False
+    original_document: bool = False
     blocks: list[FinalDocumentBlock] = Field(default_factory=list)
 
 class FinalDocumentUpdate(BaseModel):
